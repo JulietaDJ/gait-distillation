@@ -1,0 +1,33 @@
+import sys
+import os
+
+# 1. Añadir las rutas correctas
+sys.path.insert(0, "/opt3/data/julieta/OpenGait")           # Para 'opengait' y 'lib'
+sys.path.insert(0, "/opt3/data/julieta/OpenGait/opengait")  # Para que encuentre 'utils'
+sys.path.insert(0, "/opt3/data/julieta/OpenGait/lib")       # Por si acaso
+sys.path.insert(0, "/opt3/data/julieta/gait-distillation/data")
+
+# 2. Cambiar directorio de trabajo
+os.chdir("/opt3/data/julieta/OpenGait")
+
+# 3. Importar módulos base
+import opengait.data.dataset
+import opengait.data.collate_fn
+import opengait.data
+
+# 4. Importar nuestras clases
+from distillation_dataset import DistillationDataSet
+from distillation_collate import DistillationCollateFn
+
+data.dataset.DataSet = DistillationDataSet
+opengait.data.collate_fn.CollateFn = DistillationCollateFn
+
+if hasattr(opengait.data, 'DataSet'):
+    opengait.data.DataSet = DistillationDataSet
+if hasattr(opengait.data, 'CollateFn'):
+    opengait.data.CollateFn = DistillationCollateFn
+
+from opengait.main import main
+
+if __name__ == "__main__":
+    main()

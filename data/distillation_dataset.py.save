@@ -1,0 +1,45 @@
+import os
+import numpy as np
+import torch
+import yaml
+
+from pathlib import Path
+
+from opengait.data.dataset import DataSet
+
+class DistillationDataSet(DataSet):
+    """
+    DataSet personalizado que hereda de OpenGait para cargar
+    las features del maestro (VHuman3D) junto con las siluetas.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+       def __getitem__(self, idx):
+        original_data = super().__getitem__(idx)
+        sils, lab, typ, vie, seqL = original_data
+
+        seq_info = self.seqs_info[idx]
+        
+        pid = str(seq_info['pid']).zfill(3) 
+        cond = seq_info['type']             
+        view = seq_info['view']            
+        
+        teacher_path = self.teacher_root / pid / cond / view / "features.npy"
+        
+        if teacher_path.exists():
+            teacher_feat = np.load(teacher_path) 
+            
+            T = len(sils)
+            if teacher_feat.shape[0] >= T:
+                teacher_feat = teacher_feat[:T] 
+            else:
+                pad = np.zeros((T - teacher_feat.shape[0], 16, 16, 768), dtype=np.float32)
+                teacher_feat = np.concatenate([teacher_feat, pad], axis=0)
+                
+            teacher_tensor = torch.from_numpy(teacher_feat).float()
+        else:
+            print(f"Advertencia: No se encontró {teacher_path}")
+            teacher_tensor = torch.zeros((len(sils), 16, 16, 768), dtype=torch.float32)
+
+        return sils, lab, typ, vie, seqL, teacher_tensor

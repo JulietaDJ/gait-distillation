@@ -1,0 +1,91 @@
+nohup: no se tendrá en cuenta la entrada
+/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/launch.py:208: FutureWarning: The module torch.distributed.launch is deprecated
+and will be removed in future. Use torchrun.
+Note that --use-env is set by default in torchrun.
+If your script expects `--local-rank` argument to be set, please
+change it to read from `os.environ['LOCAL_RANK']` instead. See 
+https://pytorch.org/docs/stable/distributed.html#launch-utility for 
+further instructions
+
+  main()
+[2026-10-27 11:28:43] [INFO]: {'find_unused_parameters': True, 'enable_float16': True, 'with_test': False, 'fix_BN': False, 'log_iter': 100, 'restore_ckpt_strict': True, 'optimizer_reset': False, 'scheduler_reset': False, 'restore_hint': 0, 'save_iter': 10000, 'save_name': 'StudentDistill_Phase1', 'sync_BN': True, 'total_iter': 60000, 'sampler': {'batch_shuffle': False, 'batch_size': [8, 16], 'frames_num_fixed': 30, 'frames_num_max': 50, 'frames_num_min': 25, 'sample_type': 'fixed_unordered', 'type': 'TripletSampler'}, 'transform': [{'type': 'Compose', 'trf_cfg': [{'type': 'RandomHorizontalFlip', 'p': 0.5}, {'type': 'RandomRotate', 'degrees': 5}]}], 'log_interval': 100, 'log_train_accuracy': False, 'sampler_cfg': {'sampler_name': 'None'}, 'loss': [{'type': 'CrossEntropyLoss', 'weight': 1.0}, {'type': 'TripletLoss', 'weight': 1.0, 'margin': 0.2}]}
+[2026-10-27 11:28:43] [INFO]: {'model': 'StudentDistill', 'Backbone': {'mode': '2d', 'in_channels': 1, 'layers': [1, 1, 1, 1], 'channels': [64, 128, 256, 512]}, 'SeparateBNNecks': {'class_num': 74}, 'use_emb2': False}
+[2026-10-27 11:28:44] [INFO]: {'dataset_name': 'CASIA-B', 'dataset_root': '/opt3/data/julieta/CASIA-B-yolo-pkl', 'num_workers': 1, 'dataset_partition': './datasets/CASIA-B/CASIA-B.json', 'remove_no_gallery': False, 'cache': False, 'test_dataset_name': 'CASIA-B', 'teacher_root': '/opt3/data/julieta/vhuman_features'}
+[2026-10-27 11:28:44] [INFO]: -------- Train Pid List --------
+[2026-10-27 11:28:44] [INFO]: [001, 002, ..., 074], Len: 74
+[2026-10-27 11:28:45] [INFO]: {'lr': 0.1, 'momentum': 0.9, 'solver': 'SGD', 'weight_decay': 0.0005}
+[2026-10-27 11:28:45] [INFO]: {'gamma': 0.1, 'milestones': [20000, 40000, 50000], 'scheduler': 'MultiStepLR'}
+[2026-10-27 11:28:46] [INFO]: Parameters Count: 8.61792M
+[2026-10-27 11:28:46] [INFO]: Model Initialization Finished!
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/opt3/data/julieta/gait-distillation/scripts/train_distill.py", line 34, in <module>
+[rank0]:     runpy.run_path("/opt3/data/julieta/OpenGait/opengait/main.py", run_name="__main__")
+[rank0]:   File "/opt3/data/julieta/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/runpy.py", line 289, in run_path
+[rank0]:     return _run_module_code(code, init_globals, run_name,
+[rank0]:   File "/opt3/data/julieta/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/runpy.py", line 96, in _run_module_code
+[rank0]:     _run_code(code, mod_globals, init_globals,
+[rank0]:   File "/opt3/data/julieta/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+[rank0]:     exec(code, run_globals)
+[rank0]:   File "/opt3/data/julieta/OpenGait/opengait/main.py", line 76, in <module>
+[rank0]:     run_model(cfgs, training)
+[rank0]:   File "/opt3/data/julieta/OpenGait/opengait/main.py", line 59, in run_model
+[rank0]:     Model.run_train(model)
+[rank0]:   File "/opt3/data/julieta/OpenGait/opengait/modeling/base_model.py", line 416, in run_train
+[rank0]:     for inputs in model.train_loader:
+[rank0]:   File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 701, in __next__
+[rank0]:     data = self._next_data()
+[rank0]:   File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1465, in _next_data
+[rank0]:     return self._process_data(data)
+[rank0]:   File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1491, in _process_data
+[rank0]:     data.reraise()
+[rank0]:   File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/_utils.py", line 715, in reraise
+[rank0]:     raise exception
+[rank0]: TypeError: Caught TypeError in DataLoader worker process 0.
+[rank0]: Original Traceback (most recent call last):
+[rank0]:   File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py", line 351, in _worker_loop
+[rank0]:     data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+[rank0]:   File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 55, in fetch
+[rank0]:     return self.collate_fn(data)
+[rank0]:   File "/opt3/data/julieta/gait-distillation/data/distillation_collate.py", line 13, in __call__
+[rank0]:     collated = super().__call__(original_batch)
+[rank0]:   File "/opt3/data/julieta/OpenGait/opengait/data/collate_fn.py", line 47, in __call__
+[rank0]:     labs_batch.append(self.label_set.index(bt[1][0]))
+[rank0]: TypeError: 'int' object is not subscriptable
+
+[rank0]:[W1027 11:28:53.223090439 ProcessGroupNCCL.cpp:1250] Warning: WARNING: process group has NOT been destroyed before we destruct ProcessGroupNCCL. On normal program exit, the application should call destroy_process_group to ensure that any pending NCCL operations have finished in this process. In rare cases this process can exit before this point and block the progress of another member of the process group. This constraint has always been present,  but this warning has only been added since PyTorch 2.4 (function operator())
+E1027 11:28:54.778000 818343 torch/distributed/elastic/multiprocessing/api.py:869] failed (exitcode: 1) local_rank: 0 (pid: 821073) of binary: /opt3/data/julieta/venvs/opengait_yolo/bin/python
+Traceback (most recent call last):
+  File "/opt3/data/julieta/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/opt3/data/julieta/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/launch.py", line 208, in <module>
+    main()
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/typing_extensions.py", line 3140, in wrapper
+    return arg(*args, **kwargs)
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/launch.py", line 204, in main
+    launch(args)
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/launch.py", line 189, in launch
+    run(args)
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/run.py", line 910, in run
+    elastic_launch(
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 138, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/opt3/data/julieta/venvs/opengait_yolo/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 269, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+/opt3/data/julieta/gait-distillation/scripts/train_distill.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-10-27_11:28:54
+  host      : a6000ava.local
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 821073)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

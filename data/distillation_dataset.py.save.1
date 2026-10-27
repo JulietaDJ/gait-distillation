@@ -1,0 +1,47 @@
+import os
+import numpy as np
+import torch
+import yaml
+from pathlib import Path
+
+from opengait.data.dataset import DataSet
+
+class DistillationDataSet(DataSet):
+    """
+    DataSet personalizado que hereda de OpenGait para cargar
+    las features del maestro (VHuman3D) junto con las siluetas.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        import sys
+        cfgs_path = None
+        if '--cfgs' in sys.argv:
+            cfgs_path = sys.argv[sys.argv.index('--cfgs') + 1]
+        
+        if cfgs_path and Path(cfgs_path).exists():
+            with open(cfgs_path, 'r') as f:
+                cfgs = yaml.safe_load(f)
+            self.teacher_root = Path(cfgs['data_cfg'].get('teacher_root', '/opt3/data/julieta/vhuman_features'))
+        else:
+            self.teacher_root = Path("/opt3/data/julieta/vhuman_features")
+
+
+    def __getitem__(self, idx):
+        original_data = super().__getitem__(idx)
+        #sils, lab, typ, vie, seqL = original_data
+
+        if len(original_data) == 5:
+            sils, lab, typ, vie, seqL = original_data
+        elif len(original_data) == 2:
+            sils, lab = original_data
+            typ, vie, seqL = None, None, len(sils)  # Ajustar según sea necesario
+        else:
+            raise ValueError(f"Formato de salida no esperado: {len(original_data)} elementos")
+
+        if isinstance(sils
+            if teacher_feat.shape[0] >= T:
+                teacher_feat = teacher_feat[:T] 
+            else:
+                pad = np.zeros((T - teacher_feat.shape[0], 16, 16, 768), dtype=np.float32)
+                teacher_feat = np.concatenate([teacher_feat,
