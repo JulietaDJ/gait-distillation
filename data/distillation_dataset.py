@@ -1,84 +1,63 @@
-import os
-import numpy as np
-import torch
-import yaml
+"""
+DataSet de destilación: devuelve (data_list, seq_info, teacher).
+
+- data_list / seq_info: exactamente lo que devuelve el DataSet de OpenGait,
+  para que el muestreo y las etiquetas sigan la lógica estándar.
+- teacher: np.memmap con las features del maestro, [T, 16, 768] (formato
+  compacto, float16) o [T, 16, 16, 768] (formato antiguo). Se abre con
+  mmap_mode='r', así que el disco solo se lee al indexar los frames
+  muestreados en el collate. None si falta o no coincide en longitud.
+
+Claves nuevas en data_cfg:
+    teacher_root: carpeta con <pid>/<cond>/<view>/features.npy
+"""
 from pathlib import Path
 
-from opengait.data.dataset import DataSet
+import numpy as np
+
+try:  # mismo nombre de módulo que usa base_model.py de OpenGait
+    from data.dataset import DataSet
+except ImportError:  # pragma: no cover
+    from opengait.data.dataset import DataSet
+
+from utils import get_msg_mgr
+
 
 class DistillationDataSet(DataSet):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, data_cfg, training):
+        super().__init__(data_cfg, training)
+        if 'teacher_root' not in data_cfg:
+            raise KeyError("data_cfg.teacher_root es obligatorio para la destilación")
+        self.teacher_root = Path(data_cfg['teacher_root'])
+        self.prefix = f"{self.dataset_name}-"
+        self._warned = set()
 
-        import sys
-        cfgs_path = None
-        if '--cfgs' in sys.argv:
-            cfgs_path = sys.argv[sys.argv.index('--cfgs') + 1]
+    def _warn_once(self, key, msg):
+        if key not in self._warned:
+            self._warned.add(key)
+            get_msg_mgr().log_warning(msg)
 
-        if cfgs_path and Path(cfgs_path).exists():
-            with open(cfgs_path, 'r') as f:
-                cfgs = yaml.safe_load(f)
-            self.teacher_root = Path(cfgs['data_cfg'].get('teacher_root', '/opt3/data/julieta/vhuman_features'))
-        else:
-            self.teacher_root = Path("/opt3/data/julieta/vhuman_features")
+    def _teacher_path(self, seq_info):
+        pid = str(seq_info[0])
+        if pid.startswith(self.prefix):  # en training OpenGait antepone "CASIA-B-"
+            pid = pid[len(self.prefix):]
+        return self.teacher_root / pid / seq_info[1] / seq_info[2] / "features.npy"
 
     def __getitem__(self, idx):
-        # 1. Obtener info de la secuencia PRIMERO
-        seq_info = self.seqs_info[idx]
-        
-        # 2. FILTRO DE PRUEBA (Solo procesar sujetos <= 5)
-        try:
-            pid_num = int(str(seq_info[0]).replace("CASIA-B-", ""))
-        except ValueError:
-            pid_num = 0
-            
-        if pid_num > 5:
-            # Devolver un dummy válido para no romper el batch
-            sils = np.zeros((30, 64, 44), dtype=np.float32)
-            lab = 0
-            typ, vie, seqL = seq_info[1], seq_info[2], 30
-            teacher_tensor = torch.zeros((30, 16, 16, 768), dtype=torch.float32)
-            return sils, lab, typ, vie, seqL, teacher_tensor
+        data_list, seq_info = super().__getitem__(idx)
+        n_frames = len(data_list[0])
 
-        # 3. Llamar al padre para obtener las siluetas
-        original_data = super().__getitem__(idx)
+        path = self._teacher_path(seq_info)
+        if not path.exists():
+            self._warn_once(str(path), f"[Distill] Falta maestro: {path} -> secuencia enmascarada")
+            return data_list, seq_info, None
 
-        # 4. Desempaquetar
-        if len(original_data) == 5:
-            sils, lab, typ, vie, seqL = original_data
-        elif len(original_data) == 2:
-            sils, lab = original_data
-            typ = seq_info[1]
-            vie = seq_info[2]
-            seqL = len(sils)
-        else:
-            raise ValueError(f"Formato no esperado: {len(original_data)}")
+        teacher = np.load(path, mmap_mode='r')
+        if teacher.shape[0] != n_frames:
+            # Longitudes distintas = frames desalineados; no se rellena ni se recorta.
+            self._warn_once(str(path),
+                            f"[Distill] T maestro={teacher.shape[0]} != T siluetas={n_frames} "
+                            f"en {path} -> secuencia enmascarada")
+            return data_list, seq_info, None
 
-        # 5. Convertir siluetas a float32
-        if isinstance(sils, list):
-            sils = np.stack(sils, axis=0)
-        sils = sils.astype(np.float32)
-
-        # 6. Cargar el maestro desde el disco
-        raw_pid = str(seq_info[0])
-        pid = raw_pid.replace("CASIA-B-", "").zfill(3)
-        cond = seq_info[1]
-        view = seq_info[2]
-        
-        teacher_path = self.teacher_root / pid / cond / view / "features.npy"
-        
-        if teacher_path.exists():
-            teacher_feat = np.load(teacher_path) # [T_total, 16, 16, 768]
-            T = len(sils)
-            
-            if teacher_feat.shape[0] >= T:
-                teacher_feat = teacher_feat[:T] 
-            else:
-                pad = np.zeros((T - teacher_feat.shape[0], 16, 16, 768), dtype=np.float32)
-                teacher_feat = np.concatenate([teacher_feat, pad], axis=0)
-                
-            teacher_tensor = torch.from_numpy(teacher_feat).float()
-        else:
-            teacher_tensor = torch.zeros((len(sils), 16, 16, 768), dtype=torch.float32)
-
-        return sils, lab, typ, vie, seqL, teacher_tensor
+        return data_list, seq_info, teacher

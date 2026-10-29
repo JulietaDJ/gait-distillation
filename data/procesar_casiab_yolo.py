@@ -22,10 +22,12 @@ CONF_THRESHOLD = 0.3
 PERSON_CLASS_ID = 0
 
 
-def normalizar_con_padding(img, output_size=OUTPUT_SIZE):
+def normalizar_con_padding(img, output_size=OUTPUT_SIZE, interpolation=cv2.INTER_NEAREST):
     """
     Normaliza una imagen (silueta o RGB) al tamaño output_size (alto, ancho)
     manteniendo la proporción y rellenando con negro.
+    Siluetas: INTER_NEAREST (mantiene la máscara binaria).
+    RGB: INTER_AREA al reducir (evita aliasing), INTER_LINEAR al ampliar.
     """
     h, w = img.shape[:2]
     out_h, out_w = output_size
@@ -36,7 +38,7 @@ def normalizar_con_padding(img, output_size=OUTPUT_SIZE):
     nuevo_w = max(1, int(w * escala))
 
     img_resized = cv2.resize(img, (nuevo_w, nuevo_h),
-                             interpolation=cv2.INTER_NEAREST)
+                             interpolation=interpolation)
 
     # Crear lienzo negro
     if len(img.shape) == 2:
@@ -49,6 +51,17 @@ def normalizar_con_padding(img, output_size=OUTPUT_SIZE):
     x_off = (out_w - nuevo_w) // 2
     lienzo[y_off:y_off+nuevo_h, x_off:x_off+nuevo_w] = img_resized
 
+    return lienzo
+
+
+def pad_cuadrado(img, pad_factor):
+    """Centra la imagen en un cuadrado negro de pad_factor x lado mayor
+    (réplica de pad_cropped_image() del demo de VHuman3D)."""
+    h, w = img.shape[:2]
+    side = int(max(h, w) * pad_factor)
+    lienzo = np.zeros((side, side) + img.shape[2:], dtype=img.dtype)
+    y_off, x_off = (side - h) // 2, (side - w) // 2
+    lienzo[y_off:y_off + h, x_off:x_off + w] = img
     return lienzo
 
 
@@ -123,7 +136,18 @@ def main():
                         help="Carpeta destino")
     parser.add_argument("--max-sujetos", type=int, default=0,
                         help="Procesar solo N sujetos (0=todos, útil para pruebas)")
+    parser.add_argument("--rgb-size", type=int, nargs=2, metavar=("H", "W"),
+                        default=list(OUTPUT_SIZE),
+                        help="Tamaño del RGB para el maestro (por defecto igual a la silueta). "
+                             "Recomendado para VHuman3D: 256 256 con --rgb-pad-factor 1.2")
+    parser.add_argument("--rgb-pad-factor", type=float, default=0.0,
+                        help="Si > 0, el RGB se rellena a un cuadrado de factor x lado mayor "
+                             "(como el demo de VHuman3D) antes de redimensionar; requiere "
+                             "--rgb-size cuadrado. 0 = comportamiento original.")
     args = parser.parse_args()
+    rgb_size = tuple(args.rgb_size)
+    if args.rgb_pad_factor > 0 and rgb_size[0] != rgb_size[1]:
+        parser.error("--rgb-pad-factor requiere un --rgb-size cuadrado")
 
     in_root = Path(args.input)
     out_root = Path(args.output)
@@ -176,7 +200,14 @@ def main():
                         continue
 
                     # Normalizar ambos al mismo tamaño
-                    rgb_norm = normalizar_con_padding(rgb_crop, OUTPUT_SIZE)
+                    reduce = rgb_crop.shape[0] > rgb_size[0]
+                    interp = cv2.INTER_AREA if reduce else cv2.INTER_LINEAR
+                    if args.rgb_pad_factor > 0:
+                        rgb_sq = pad_cuadrado(rgb_crop, args.rgb_pad_factor)
+                        rgb_norm = cv2.resize(rgb_sq, (rgb_size[1], rgb_size[0]),
+                                              interpolation=interp)
+                    else:
+                        rgb_norm = normalizar_con_padding(rgb_crop, rgb_size, interp)
                     sil_norm = normalizar_con_padding(sil_crop, OUTPUT_SIZE)
 
                     # Guardar con el mismo nombre base
