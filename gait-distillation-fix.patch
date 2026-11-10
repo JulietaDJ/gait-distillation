@@ -1,0 +1,2121 @@
+From d1117ad10bb358ead1ed1798c88ce0e371530f3a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Xavier=20P=C3=A9rez?=
+ <franciscoxavier.perez.sanjuan@gmail.com>
+Date: Thu, 29 Oct 2026 10:29:17 +0100
+Subject: [PATCH 1/3] =?UTF-8?q?Corrige=20alineaci=C3=B3n=20estudiante-maes?=
+ =?UTF-8?q?tro=20y=20optimiza=20la=20carga=20de=20datos?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Dataset: usa (data_list, seq_info) de OpenGait; elimina el filtro dummy
+  (causa del TypeError) y el bug T=1 que dejaba el maestro en ceros.
+- Collate: muestrea índices una vez y los aplica a siluetas y maestro;
+  máscara para secuencias sin maestro o con longitud distinta.
+- Maestro leído con mmap_mode='r' (solo frames muestreados), fp16.
+- Modelo: get_loader e inputs_pretreament propios (sin monkeypatching),
+  CE con logits de BNNecks, pérdidas de reconocimiento opcionales.
+- Pérdida: hereda BaseLoss, enmascarada, cálculo en fp32, LayerNorm opcional.
+- Config: /255 en entrenamiento, sin flip/rotación, AdamW, sampler explícito.
+- Extracción: salida compacta [T,16,768] fp16 + frames.txt, por lotes,
+  reporte de claves sin cargar, modo --check, preprocesado parametrizable.
+- Nuevos: calcular_stats_maestro.py, install_into_opengait.sh, README,
+  partición de depuración y .gitignore.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WK6ob9J25CSVfCkuYYaVq8
+---
+ .gitignore                          |   7 +
+ README.md                           |  37 ++++
+ configs/CASIA-B-debug5.json         |  16 ++
+ configs/student_distill_casiab.yaml | 102 +++++------
+ data/calcular_stats_maestro.py      |  63 +++++++
+ data/distillation_collate.py        | 117 ++++++++----
+ data/distillation_dataset.py        | 133 ++++++--------
+ data/extraer_features_vhuman.py     | 266 +++++++++++++++++++---------
+ data/procesar_casiab_yolo.py        |  16 +-
+ losses/distillation_loss.py         |  91 +++++-----
+ models/student_distill.py           | 215 +++++++++++-----------
+ scripts/install_into_opengait.sh    |  20 +++
+ scripts/train_distill.py            |  56 +++---
+ 13 files changed, 730 insertions(+), 409 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 README.md
+ create mode 100644 configs/CASIA-B-debug5.json
+ create mode 100644 data/calcular_stats_maestro.py
+ create mode 100755 scripts/install_into_opengait.sh
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..3ded4af
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,7 @@
++__pycache__/
++*.pyc
++*.save
++*.save.*
++*.log
++*.bak.*
++output/
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..05a154e
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,37 @@
++# gait-distillation
++
++Feature distillation VHuman3D (RGB, congelado) → DeepGaitV2-2D (siluetas 64×44) sobre OpenGait.
++
++## Pipeline
++
++| Paso | Script | Salida |
++|---|---|---|
++| 1. Siluetas + RGB recortado | `data/procesar_casiab_yolo.py [--rgb-size H W]` | `CASIA-B-yolo/{silhouettes,rgb}/<pid>/<cond>/<view>/<frame>.png` |
++| 2. Empaquetado OpenGait | `data/empaquetar_pkl.py` | `CASIA-B-yolo-pkl/<pid>/<cond>/<view>/<view>-sils.pkl` |
++| 3. Diagnóstico del maestro | `data/extraer_features_vhuman.py --check` | claves sin cargar, forma de la rejilla, perfiles por eje |
++| 4. Features del maestro | `data/extraer_features_vhuman.py` | `vhuman_features_v2/.../features.npy` fp16 `[T,16,768]` + `frames.txt` |
++| 5. Estadísticas | `data/calcular_stats_maestro.py` | `teacher_stats.npz` (solo TRAIN_SET) |
++| 6. Instalación en OpenGait | `scripts/install_into_opengait.sh` | enlaces en `opengait/modeling/{models,losses}` |
++| 7. Entrenamiento | `scripts/train_distill.py` | `OpenGait/output/CASIA-B/StudentDistill/...` |
++
++```bash
++bash scripts/install_into_opengait.sh
++python -m torch.distributed.run --nproc_per_node=1 scripts/train_distill.py \
++    --cfgs configs/student_distill_casiab.yaml --phase train --log_to_file
++```
++
++Prueba rápida con 5 sujetos: `dataset_partition: <repo>/configs/CASIA-B-debug5.json`.
++
++## Diseño
++
++- `StudentDistill` sobrescribe `get_loader` e `inputs_pretreament`: no hay monkeypatching ni
++  cambios en el núcleo de OpenGait (el parche de `ts2var` ya no es necesario para este modelo).
++- El collate muestrea los índices de frames una vez y los aplica a siluetas y maestro.
++- Secuencias sin maestro o con longitud distinta se enmascaran (`mask`) y no aportan pérdida.
++- Sin augmentaciones geométricas: el maestro está precalculado.
++- El maestro se lee con `mmap_mode='r'`: solo se leen del disco los frames muestreados.
++
++## Pendiente de verificar con el código de VHuman3D
++
++`--layout`, `--normalize`, `--input-size` y los ejes `--depth-axis/--reduce-axis` de la
++extracción. Los valores por defecto reproducen el comportamiento original.
+diff --git a/configs/CASIA-B-debug5.json b/configs/CASIA-B-debug5.json
+new file mode 100644
+index 0000000..260294a
+--- /dev/null
++++ b/configs/CASIA-B-debug5.json
+@@ -0,0 +1,16 @@
++{
++  "TRAIN_SET": [
++    "001",
++    "002",
++    "003",
++    "004",
++    "005"
++  ],
++  "TEST_SET": [
++    "075",
++    "076",
++    "077",
++    "078",
++    "079"
++  ]
++}
+\ No newline at end of file
+diff --git a/configs/student_distill_casiab.yaml b/configs/student_distill_casiab.yaml
+index b343211..7f190a4 100644
+--- a/configs/student_distill_casiab.yaml
++++ b/configs/student_distill_casiab.yaml
+@@ -1,13 +1,22 @@
+ # ==========================================
+-# Fase 1: Feature Distillation
++# Fase 1: Feature Distillation (VHuman3D -> DeepGaitV2-2D)
+ # ==========================================
++# Para pruebas con 5 sujetos: dataset_partition: <repo>/configs/CASIA-B-debug5.json
+ 
+ data_cfg:
+   dataset_name: CASIA-B
+   dataset_root: /opt3/data/julieta/CASIA-B-yolo-pkl
+   dataset_partition: ./datasets/CASIA-B/CASIA-B.json
+-  teacher_root: /opt3/data/julieta/vhuman_features
+-  num_workers: 1
++  # Formato compacto [T,16,768] fp16 generado por data/extraer_features_vhuman.py.
++  # El formato antiguo [T,16,16,768] también se acepta (más lento, solo para pruebas).
++  teacher_root: /opt3/data/julieta/vhuman_features_v2
++  # Estandarización por canal (data/calcular_stats_maestro.py). Comentar si no existe aún
++  # y usar en su lugar teacher_norm: layernorm en la pérdida.
++  teacher_stats: /opt3/data/julieta/vhuman_features_v2/teacher_stats.npz
++  # Solo para el formato antiguo: eje de la rejilla [16,16] a promediar (0 = comportamiento original).
++  legacy_reduce_axis: 0
++  num_workers: 4            # servidor compartido: subir solo si la GPU espera al DataLoader
++  cache: false
+   remove_no_gallery: false
+   test_dataset_name: CASIA-B
+ 
+@@ -17,64 +26,63 @@ evaluator_cfg:
+   restore_hint: 0
+   save_name: StudentDistill_Phase1
+   eval_func: evaluate_indoor_dataset
+-  sampler_cfg:
+-    sampler_name: None
++  sampler:
++    batch_size: 4
++    sample_type: all_ordered
++    type: InferenceSampler
+   transform:
+-    - type: BaseSilCuttingTransform
+-      cutting: true
+-      size: [64, 44]
++    - type: BaseSilCuttingTransform   # /255; con ancho 44 no recorta
+   metric: euc
+-  loss:
+-    - type: CrossEntropyLoss
+-      weight: 1.0
+-    - type: TripletLoss
+-      weight: 1.0
+-      margin: 0.2
+ 
+ loss_cfg:
+-  - loss_term_weight: 1.0
+-    margin: 0.2
+-    type: TripletLoss
+-    log_prefix: triplet
+-  - loss_term_weight: 1.0
+-    scale: 16
+-    type: CrossEntropyLoss
+-    log_prefix: softmax
+-    log_accuracy: true
+-  - loss_term_weight: 1.0
+-    type: DistillationLoss
++  - type: DistillationLoss
+     log_prefix: distill
++    loss_term_weight: 1.0
+     w_l1: 1.0
+     w_cos: 1.0
++    beta: 1.0
++    teacher_norm: none        # 'layernorm' si no se usa teacher_stats
++  # Regularizador de reconocimiento (fase 2 / opcional). Requiere model_cfg.recognition_losses: true
++  # - type: TripletLoss
++  #   log_prefix: triplet
++  #   loss_term_weight: 0.1
++  #   margin: 0.2
++  # - type: CrossEntropyLoss
++  #   log_prefix: softmax
++  #   loss_term_weight: 0.1
++  #   scale: 16
++  #   log_accuracy: true
+ 
+ model_cfg:
+   model: StudentDistill
+   Backbone:
+-    mode: 2d               
+     in_channels: 1
+-    layers: [1, 1, 1, 1]   
++    layers: [1, 1, 1, 1]
+     channels: [64, 128, 256, 512]
+   SeparateBNNecks:
+-    class_num: 74         
+-  use_emb2: false
++    class_num: 74
++  teacher_dim: 768
++  proj_hidden: 1024
++  recognition_losses: false
++  use_emb2: true              # FCs/BNNecks no se entrenan en fase 1: la inferencia de reconocimiento no es significativa
+ 
++# Regresión de features: AdamW suele ser más estable que SGD lr=0.1 (heredado de reconocimiento).
+ optimizer_cfg:
+-  lr: 0.1
+-  momentum: 0.9
+-  weight_decay: 0.0005
++  solver: AdamW
++  lr: 0.001
++  weight_decay: 0.01
+ 
+ scheduler_cfg:
+   scheduler: MultiStepLR
+-  milestones: [20000, 40000, 50000]
++  milestones: [30000, 50000]
+   gamma: 0.1
+ 
+ trainer_cfg:
+-  find_unused_parameters: True
++  find_unused_parameters: true   # FCs/BNNecks no participan si recognition_losses = false
+   enable_float16: true
++  with_test: false
+   log_iter: 100
+-  log_interval: 100
+   fix_BN: false
+-  log_train_accuracy: false
+   optimizer_reset: false
+   scheduler_reset: false
+   restore_ckpt_strict: true
+@@ -83,18 +91,12 @@ trainer_cfg:
+   save_name: StudentDistill_Phase1
+   sync_BN: true
+   total_iter: 60000
+-  sampler_cfg:
+-    sampler_name: None
++  sampler:
++    type: TripletSampler
++    batch_shuffle: false
++    batch_size: [8, 16]
++    sample_type: fixed_unordered
++    frames_num_fixed: 30
++  # Sin flip/rotación: el maestro está precalculado y no recibe la misma augmentación.
+   transform:
+-    - type: Compose
+-      trf_cfg:
+-        - type: RandomHorizontalFlip
+-          p: 0.5
+-        - type: RandomRotate
+-          degrees: 5
+-  loss:
+-    - type: CrossEntropyLoss
+-      weight: 1.0
+-    - type: TripletLoss
+-      weight: 1.0
+-      margin: 0.2
++    - type: BaseSilCuttingTransform
+diff --git a/data/calcular_stats_maestro.py b/data/calcular_stats_maestro.py
+new file mode 100644
+index 0000000..94dfc31
+--- /dev/null
++++ b/data/calcular_stats_maestro.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""
++Media y desviación por canal de las features del maestro, SOLO sobre TRAIN_SET.
++
++Uso:
++    python calcular_stats_maestro.py \
++        --teacher-root /opt3/data/julieta/vhuman_features_v2 \
++        --partition /opt3/data/julieta/OpenGait/datasets/CASIA-B/CASIA-B.json \
++        --output /opt3/data/julieta/vhuman_features_v2/teacher_stats.npz
++
++El .npz resultante (mean, std con forma [768], o [16, 768] con --per-part)
++se indica en data_cfg.teacher_stats y el collate estandariza el maestro.
++"""
++import argparse
++import json
++from pathlib import Path
++
++import numpy as np
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--teacher-root", required=True)
++    p.add_argument("--partition", required=True)
++    p.add_argument("--output", required=True)
++    p.add_argument("--per-part", action="store_true", help="Estadísticas por (parte, canal)")
++    p.add_argument("--max-frames-seq", type=int, default=0, help="Submuestrear frames por secuencia (0 = todos)")
++    args = p.parse_args()
++
++    train = json.loads(Path(args.partition).read_text())["TRAIN_SET"]
++    root = Path(args.teacher_root)
++    axes = (0,) if args.per_part else (0, 1)
++
++    s = ss = None
++    count = 0
++    n_seq = 0
++    for pid in train:
++        for f in sorted((root / pid).glob("*/*/features.npy")):
++            x = np.load(f, mmap_mode="r")
++            if args.max_frames_seq and len(x) > args.max_frames_seq:
++                x = x[np.linspace(0, len(x) - 1, args.max_frames_seq).astype(int)]
++            x = np.asarray(x, dtype=np.float64)
++            if x.ndim == 4:
++                raise SystemExit(f"{f} está en formato antiguo [T,16,16,768]; reextrae primero")
++            if s is None:
++                s = np.zeros(x.shape[1:] if args.per_part else x.shape[-1:])
++                ss = np.zeros_like(s)
++            s += x.sum(axis=axes)
++            ss += (x ** 2).sum(axis=axes)
++            count += x.shape[0] * (1 if args.per_part else x.shape[1])
++            n_seq += 1
++
++    if count == 0:
++        raise SystemExit("No se encontraron features para TRAIN_SET")
++    mean = s / count
++    std = np.sqrt(np.maximum(ss / count - mean ** 2, 0.0))
++    np.savez(args.output, mean=mean.astype(np.float32), std=std.astype(np.float32))
++    print(f"Secuencias: {n_seq} | muestras: {count} | mean∈[{mean.min():.3f}, {mean.max():.3f}] "
++          f"| std∈[{std.min():.3f}, {std.max():.3f}] -> {args.output}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/data/distillation_collate.py b/data/distillation_collate.py
+index 9b7ef36..e7295ee 100644
+--- a/data/distillation_collate.py
++++ b/data/distillation_collate.py
+@@ -1,38 +1,95 @@
++"""
++Collate de destilación.
++
++Los índices de frames se muestrean UNA sola vez por secuencia y se aplican
++tanto a las siluetas como al maestro, de modo que el frame i del estudiante
++corresponde al frame i del maestro.
++
++Salida (7 elementos):
++    [seqs, labs, typs, vies, seqL, teacher, mask]
++    seqs, labs, typs, vies, seqL : idéntico al CollateFn de OpenGait
++    teacher : torch.float16 [N, T, 16, 768]  (None si el sampler no es 'fixed')
++    mask    : torch.bool    [N, T]           True = frame con maestro válido
++"""
++import math
++import random
++
+ import numpy as np
+ import torch
+-from opengait.data.collate_fn import CollateFn
++
++try:
++    from data.collate_fn import CollateFn
++except ImportError:  # pragma: no cover
++    from opengait.data.collate_fn import CollateFn
++
+ 
+ class DistillationCollateFn(CollateFn):
+-    def __init__(self, label_set, sample_config):
++    def __init__(self, label_set, sample_config, teacher_stats=None,
++                 legacy_reduce_axis=0, parts=16, dim=768):
+         super().__init__(label_set, sample_config)
++        self.parts, self.dim = parts, dim
++        # Solo formato antiguo [T, 16, 16, 768]: eje de la rejilla (sin T) a promediar.
++        # 0 reproduce el mean(dim=1) original.
++        self.legacy_reduce_axis = legacy_reduce_axis
++        self.mean = self.std = None
++        if teacher_stats:
++            st = np.load(teacher_stats)
++            self.mean = st['mean'].astype(np.float32)
++            self.std = np.maximum(st['std'].astype(np.float32), 1e-6)
++
++    # ------------------------------------------------------------------ #
++    def _sample_indices(self, seq_len):
++        """Réplica de la lógica 'fixed' de CollateFn.sample_frames, devolviendo índices."""
++        n = self.frames_num_fixed
++        if self.allordered:
++            return np.sort(np.random.choice(seq_len, n, replace=seq_len < n))
++        if self.ordered:
++            fs_n = n + self.frames_skip_num
++            idx = list(range(seq_len))
++            if seq_len < fs_n:
++                it = math.ceil(fs_n / seq_len)
++                idx = idx * it
++            start = random.choice(range(0, len(idx) - fs_n + 1))
++            window = np.sort(np.random.choice(fs_n, n, replace=False)) + start
++            return np.asarray([idx[i] for i in window])
++        return np.random.choice(seq_len, n, replace=seq_len < n)
+ 
++    def _prepare_teacher(self, teacher, idx):
++        t = np.asarray(teacher[np.sort(idx)], dtype=np.float32)  # lectura ordenada del memmap
++        t = t[np.argsort(np.argsort(idx))]                         # restaurar el orden muestreado
++        if t.ndim == 4:                                            # formato antiguo
++            t = t.mean(axis=1 + self.legacy_reduce_axis)
++        if self.mean is not None:
++            t = (t - self.mean) / self.std
++        return t
++
++    # ------------------------------------------------------------------ #
+     def __call__(self, batch):
+-        original_batch = [item[:5] for item in batch]
+-        teacher_feats = [item[5] for item in batch]
+-
+-        collated = super().__call__(original_batch)
+-        
+-        collated[0] = [[seq.astype(np.float32) for seq in feat] for feat in collated[0]]
+-
+-        if self.sampler == 'fixed':
+-            frames_num = self.frames_num_fixed
+-        else:
+-            frames_num = teacher_feats[0].shape[0]
+-
+-        teacher_batch = []
+-        for t_feat in teacher_feats:
+-            T = t_feat.shape[0]
+-            if T >= frames_num:
+-                indices = np.linspace(0, T - 1, frames_num).astype(int)
+-                t_sampled = t_feat[indices]
++        if self.sampler != 'fixed':
++            # Evaluación ('all_ordered'): comportamiento estándar, sin maestro.
++            out = super().__call__([(d, s) for d, s, _ in batch])
++            return out + [None, None]
++
++        feature_num = len(batch[0][0])
++        n = self.frames_num_fixed
++        fras = [[] for _ in range(feature_num)]
++        labs, typs, vies, teachers, masks = [], [], [], [], []
++
++        for data_list, seq_info, teacher in batch:
++            idx = self._sample_indices(len(data_list[0]))
++            for k in range(feature_num):
++                fras[k].append(np.asarray(data_list[k][idx]))
++            labs.append(self.label_set.index(seq_info[0]))
++            typs.append(seq_info[1])
++            vies.append(seq_info[2])
++
++            if teacher is None:
++                teachers.append(np.zeros((n, self.parts, self.dim), np.float32))
++                masks.append(np.zeros(n, bool))
+             else:
+-                pad = torch.zeros((frames_num - T, 16, 16, 768), dtype=t_feat.dtype)
+-                t_sampled = torch.cat([t_feat, pad], dim=0)
+-                
+-            # Colapsar la dimensión espacial
+-            t_sampled = t_sampled.mean(dim=1) # [frames_num, 16, 768]
+-            
+-            teacher_batch.append(t_sampled)
+-
+-        teacher_batch = torch.stack(teacher_batch, dim=0) # [N, T, 16, 768]
+-        return collated[0], collated[1], collated[2], collated[3], collated[4], teacher_batch
++                teachers.append(self._prepare_teacher(teacher, idx))
++                masks.append(np.ones(n, bool))
++
++        teacher_b = torch.from_numpy(np.stack(teachers)).half()   # [N, T, 16, 768]
++        mask_b = torch.from_numpy(np.stack(masks))                 # [N, T]
++        return [fras, labs, typs, vies, None, teacher_b, mask_b]
+diff --git a/data/distillation_dataset.py b/data/distillation_dataset.py
+index 2fff6de..fe92f20 100644
+--- a/data/distillation_dataset.py
++++ b/data/distillation_dataset.py
+@@ -1,84 +1,63 @@
+-import os
+-import numpy as np
+-import torch
+-import yaml
++"""
++DataSet de destilación: devuelve (data_list, seq_info, teacher).
++
++- data_list / seq_info: exactamente lo que devuelve el DataSet de OpenGait,
++  para que el muestreo y las etiquetas sigan la lógica estándar.
++- teacher: np.memmap con las features del maestro, [T, 16, 768] (formato
++  compacto, float16) o [T, 16, 16, 768] (formato antiguo). Se abre con
++  mmap_mode='r', así que el disco solo se lee al indexar los frames
++  muestreados en el collate. None si falta o no coincide en longitud.
++
++Claves nuevas en data_cfg:
++    teacher_root: carpeta con <pid>/<cond>/<view>/features.npy
++"""
+ from pathlib import Path
+ 
+-from opengait.data.dataset import DataSet
+-
+-class DistillationDataSet(DataSet):
+-    def __init__(self, *args, **kwargs):
+-        super().__init__(*args, **kwargs)
+-
+-        import sys
+-        cfgs_path = None
+-        if '--cfgs' in sys.argv:
+-            cfgs_path = sys.argv[sys.argv.index('--cfgs') + 1]
+-
+-        if cfgs_path and Path(cfgs_path).exists():
+-            with open(cfgs_path, 'r') as f:
+-                cfgs = yaml.safe_load(f)
+-            self.teacher_root = Path(cfgs['data_cfg'].get('teacher_root', '/opt3/data/julieta/vhuman_features'))
+-        else:
+-            self.teacher_root = Path("/opt3/data/julieta/vhuman_features")
+-
+-    def __getitem__(self, idx):
+-        # 1. Obtener info de la secuencia PRIMERO
+-        seq_info = self.seqs_info[idx]
+-        
+-        # 2. FILTRO DE PRUEBA (Solo procesar sujetos <= 5)
+-        try:
+-            pid_num = int(str(seq_info[0]).replace("CASIA-B-", ""))
+-        except ValueError:
+-            pid_num = 0
+-            
+-        if pid_num > 5:
+-            # Devolver un dummy válido para no romper el batch
+-            sils = np.zeros((30, 64, 44), dtype=np.float32)
+-            lab = 0
+-            typ, vie, seqL = seq_info[1], seq_info[2], 30
+-            teacher_tensor = torch.zeros((30, 16, 16, 768), dtype=torch.float32)
+-            return sils, lab, typ, vie, seqL, teacher_tensor
++import numpy as np
+ 
+-        # 3. Llamar al padre para obtener las siluetas
+-        original_data = super().__getitem__(idx)
++try:  # mismo nombre de módulo que usa base_model.py de OpenGait
++    from data.dataset import DataSet
++except ImportError:  # pragma: no cover
++    from opengait.data.dataset import DataSet
+ 
+-        # 4. Desempaquetar
+-        if len(original_data) == 5:
+-            sils, lab, typ, vie, seqL = original_data
+-        elif len(original_data) == 2:
+-            sils, lab = original_data
+-            typ = seq_info[1]
+-            vie = seq_info[2]
+-            seqL = len(sils)
+-        else:
+-            raise ValueError(f"Formato no esperado: {len(original_data)}")
++from utils import get_msg_mgr
+ 
+-        # 5. Convertir siluetas a float32
+-        if isinstance(sils, list):
+-            sils = np.stack(sils, axis=0)
+-        sils = sils.astype(np.float32)
+ 
+-        # 6. Cargar el maestro desde el disco
+-        raw_pid = str(seq_info[0])
+-        pid = raw_pid.replace("CASIA-B-", "").zfill(3)
+-        cond = seq_info[1]
+-        view = seq_info[2]
+-        
+-        teacher_path = self.teacher_root / pid / cond / view / "features.npy"
+-        
+-        if teacher_path.exists():
+-            teacher_feat = np.load(teacher_path) # [T_total, 16, 16, 768]
+-            T = len(sils)
+-            
+-            if teacher_feat.shape[0] >= T:
+-                teacher_feat = teacher_feat[:T] 
+-            else:
+-                pad = np.zeros((T - teacher_feat.shape[0], 16, 16, 768), dtype=np.float32)
+-                teacher_feat = np.concatenate([teacher_feat, pad], axis=0)
+-                
+-            teacher_tensor = torch.from_numpy(teacher_feat).float()
+-        else:
+-            teacher_tensor = torch.zeros((len(sils), 16, 16, 768), dtype=torch.float32)
++class DistillationDataSet(DataSet):
++    def __init__(self, data_cfg, training):
++        super().__init__(data_cfg, training)
++        if 'teacher_root' not in data_cfg:
++            raise KeyError("data_cfg.teacher_root es obligatorio para la destilación")
++        self.teacher_root = Path(data_cfg['teacher_root'])
++        self.prefix = f"{self.dataset_name}-"
++        self._warned = set()
++
++    def _warn_once(self, key, msg):
++        if key not in self._warned:
++            self._warned.add(key)
++            get_msg_mgr().log_warning(msg)
++
++    def _teacher_path(self, seq_info):
++        pid = str(seq_info[0])
++        if pid.startswith(self.prefix):  # en training OpenGait antepone "CASIA-B-"
++            pid = pid[len(self.prefix):]
++        return self.teacher_root / pid / seq_info[1] / seq_info[2] / "features.npy"
+ 
+-        return sils, lab, typ, vie, seqL, teacher_tensor
++    def __getitem__(self, idx):
++        data_list, seq_info = super().__getitem__(idx)
++        n_frames = len(data_list[0])
++
++        path = self._teacher_path(seq_info)
++        if not path.exists():
++            self._warn_once(str(path), f"[Distill] Falta maestro: {path} -> secuencia enmascarada")
++            return data_list, seq_info, None
++
++        teacher = np.load(path, mmap_mode='r')
++        if teacher.shape[0] != n_frames:
++            # Longitudes distintas = frames desalineados; no se rellena ni se recorta.
++            self._warn_once(str(path),
++                            f"[Distill] T maestro={teacher.shape[0]} != T siluetas={n_frames} "
++                            f"en {path} -> secuencia enmascarada")
++            return data_list, seq_info, None
++
++        return data_list, seq_info, teacher
+diff --git a/data/extraer_features_vhuman.py b/data/extraer_features_vhuman.py
+index 92f21cc..0e39bbb 100644
+--- a/data/extraer_features_vhuman.py
++++ b/data/extraer_features_vhuman.py
+@@ -1,107 +1,209 @@
+-import os
++#!/usr/bin/env python3
++"""
++Extrae las features del maestro VHuman3D en formato compacto.
++
++Salida por secuencia (<out>/<pid>/<cond>/<view>/):
++    features.npy : float16 [T, 16, 768]   (antes float32 [T, 16, 16, 768], ~32x más grande)
++    frames.txt   : nombres de los T frames, en el mismo orden que el .pkl de siluetas
++
++Reducción de la rejilla 3D [G0, G1, G2, C] -> [16, C]:
++    --depth-axis : eje de la rejilla que se reduce con max  (antes: 2, vol.max(dim=3))
++    --reduce-axis: eje de la rejilla que se reduce con mean (antes: 0, mean(dim=1) en el collate)
++    El eje restante debe ser el VERTICAL (altura), para corresponder con las 16 franjas
++    horizontales de la HPP del estudiante. Verificar con --check y el código de VHuman3D.
++
++Preprocesado de entrada (pendiente de confirmar con el código de VHuman3D):
++    --layout nhwc|nchw, --normalize none|imagenet, --input-size H W
++    Los valores por defecto reproducen el comportamiento original.
++
++Robustez:
++    - Si falla un solo frame, la secuencia completa se descarta (evita desalinear índices).
++    - Si se da --sil-root, solo se procesan secuencias cuyos frames coinciden con las siluetas.
++    - Reanudable: salta secuencias ya extraídas salvo --overwrite.
++"""
+ import argparse
++import os
++import sys
+ from pathlib import Path
+ 
++import cv2
+ import numpy as np
+ import torch
+-import cv2
+-from PIL import Image
+-import sys
+ 
+-sys.path.insert(0, "/opt3/data/julieta/vhuman3d/vhuman3d_deploy")
++IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
++IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+ 
+-from vhuman3d.architectures import model_builder
+ 
+-def cargar_modelo(config_path, weights_path, device="cuda"):
++def cargar_modelo(config_path, weights_path, device, allow_missing=False):
++    from vhuman3d.architectures import model_builder
+     model = model_builder(config_path).to(device)
+-    model.load_state_dict(
+-        torch.load(weights_path, weights_only=True),
+-        strict=False,
+-    )
++    state = torch.load(weights_path, map_location=device, weights_only=True)
++    res = model.load_state_dict(state, strict=False)
++    print(f"[load] missing keys: {len(res.missing_keys)} | unexpected keys: {len(res.unexpected_keys)}")
++    for k in res.missing_keys[:20]:
++        print(f"   missing   : {k}")
++    for k in res.unexpected_keys[:20]:
++        print(f"   unexpected: {k}")
++    if res.missing_keys and not allow_missing:
++        sys.exit("[load] Hay pesos sin cargar: el maestro estaría parcialmente aleatorio. "
++                 "Revisa el checkpoint o usa --allow-missing si es intencionado.")
+     model.eval()
+     return model
+ 
+-def extraer_tensor_frame(model, rgb_np, device="cuda"):
+-
+-    x = torch.from_numpy(rgb_np.astype(np.float32) / 255.0).to(device)
+-    x = x.unsqueeze(0)
+-
+-    with torch.no_grad():
+-        # 2. Backbone
+-        backbone_out = model.forward_backbone(x)
+-        
+-        # 3. Proyección y pos encoding
+-        backbone_out = model.backbone_projection(backbone_out)
+-        backbone_out = backbone_out + model.backbone_pos.unsqueeze(0).repeat(
+-            backbone_out.shape[0], 1, 1
+-        )
+-        
+-        # 4. Decoder 3D
+-        vol = model.embeddings_3d + model.pos_encoding
+-        vol = vol.unsqueeze(0).repeat(backbone_out.shape[0], 1, 1)
+-        for i in range(len(model.decoder_3d)):
+-            vol = model.decoder_3d[i](vol, backbone_out)
+-                    
+-        # 5. Reorganizar al volumen 3D
+-        vol = vol.view(vol.shape[0], *model.init_3d_grid_shape, model.embedding_dim_3d)
+-        
+-        vol_2d, _ = vol.max(dim=3) 
+-
+-    return vol_2d.squeeze(0).cpu().numpy() 
+ 
+-def main():
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--rgb-root", default="/opt3/data/julieta/CASIA-B-yolo/rgb/")
+-    parser.add_argument("--output", default="/opt3/data/julieta/vhuman_features")
+-    parser.add_argument("--config", default="vhuman3d/architectures/configs/vhuman3d_vitb.json")
+-    parser.add_argument("--weights", default="runs/run_1778669751/model_clean.pt")
+-    parser.add_argument("--max-sujetos", type=int, default=0)
+-    args = parser.parse_args()
++def preprocesar(rgb_list, args, device):
++    """Lista de RGB uint8 [H, W, 3] -> tensor [B, 3, H, W] o [B, H, W, 3]."""
++    out = []
++    for img in rgb_list:
++        if args.input_size:
++            h, w = args.input_size
++            interp = cv2.INTER_AREA if img.shape[0] > h else cv2.INTER_LINEAR
++            img = cv2.resize(img, (w, h), interpolation=interp)
++        x = img.astype(np.float32) / 255.0
++        if args.normalize == 'imagenet':
++            x = (x - IMAGENET_MEAN) / IMAGENET_STD
++        out.append(x)
++    x = torch.from_numpy(np.stack(out)).to(device)          # [B, H, W, 3]
++    if args.layout == 'nchw':
++        x = x.permute(0, 3, 1, 2).contiguous()
++    return x
++
++
++@torch.no_grad()
++def volumen_3d(model, x):
++    """Reproduce el forward interno del maestro hasta el volumen [B, G0, G1, G2, C]."""
++    feats = model.forward_backbone(x)
++    feats = model.backbone_projection(feats)
++    feats = feats + model.backbone_pos.unsqueeze(0).expand(feats.shape[0], -1, -1)
++
++    # repeat (no expand): el decoder podría operar in-place sobre las queries
++    vol = (model.embeddings_3d + model.pos_encoding).unsqueeze(0).repeat(feats.shape[0], 1, 1)
++    for layer in model.decoder_3d:
++        vol = layer(vol, feats)
++    return vol.reshape(vol.shape[0], *model.init_3d_grid_shape, model.embedding_dim_3d)
++
++
++def reducir(vol, depth_axis, reduce_axis):
++    """[B, G0, G1, G2, C] -> [B, G_restante, C]."""
++    d, r = depth_axis + 1, reduce_axis + 1
++    vol = vol.amax(dim=d)
++    r = r - 1 if r > d else r
++    return vol.mean(dim=r)
++
++
++def check(model, args, device, rgb_root):
++    print(f"[check] init_3d_grid_shape = {tuple(model.init_3d_grid_shape)}, "
++          f"embedding_dim_3d = {model.embedding_dim_3d}")
++    seq = next(p for p in sorted(rgb_root.glob('*/*/*')) if p.is_dir() and any(p.glob('*.png')))
++    frames = sorted(seq.glob('*.png'))[:8]
++    rgb = [cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB) for f in frames]
++    print(f"[check] secuencia: {seq} | frame original {rgb[0].shape}")
++    for layout in ('nhwc', 'nchw'):
++        args.layout = layout
++        try:
++            vol = volumen_3d(model, preprocesar(rgb, args, device))
++            print(f"[check] layout={layout}: vol {tuple(vol.shape)}, media={vol.mean():.4f}, "
++                  f"std={vol.std():.4f}, std entre frames={vol.std(dim=0).mean():.4f}")
++            # Varianza por eje: el eje vertical debería mostrar estructura (varianza alta).
++            for ax in range(3):
++                dims = tuple(i + 1 for i in range(3) if i != ax)
++                prof = vol.float().norm(dim=-1).mean(dim=(0,) + dims)
++                print(f"         perfil de norma a lo largo del eje {ax}: "
++                      f"{np.round(prof.cpu().numpy(), 2).tolist()}")
++        except Exception as e:  # noqa: BLE001
++            print(f"[check] layout={layout}: ERROR -> {type(e).__name__}: {e}")
+ 
+-    root_vhuman = Path("/opt3/data/julieta/vhuman3d/vhuman3d_deploy")
+-    os.chdir(root_vhuman)
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--rgb-root", default="/opt3/data/julieta/CASIA-B-yolo/rgb/")
++    p.add_argument("--sil-root", default="/opt3/data/julieta/CASIA-B-yolo/silhouettes/",
++                   help="Para verificar que los frames coinciden con las siluetas ('' para omitir)")
++    p.add_argument("--output", default="/opt3/data/julieta/vhuman_features_v2")
++    p.add_argument("--vhuman-root", default="/opt3/data/julieta/vhuman3d/vhuman3d_deploy")
++    p.add_argument("--config", default="vhuman3d/architectures/configs/vhuman3d_vitb.json")
++    p.add_argument("--weights", default="runs/run_1778669751/model_clean.pt")
++    p.add_argument("--max-sujetos", type=int, default=0)
++    p.add_argument("--batch-size", type=int, default=64)
++    p.add_argument("--layout", choices=["nhwc", "nchw"], default="nhwc")
++    p.add_argument("--normalize", choices=["none", "imagenet"], default="none")
++    p.add_argument("--input-size", type=int, nargs=2, metavar=("H", "W"), default=None)
++    p.add_argument("--depth-axis", type=int, default=2, choices=[0, 1, 2])
++    p.add_argument("--reduce-axis", type=int, default=0, choices=[0, 1, 2])
++    p.add_argument("--allow-missing", action="store_true")
++    p.add_argument("--overwrite", action="store_true")
++    p.add_argument("--check", action="store_true", help="Diagnóstico sobre 8 frames y salir")
++    args = p.parse_args()
++    if args.depth_axis == args.reduce_axis:
++        sys.exit("--depth-axis y --reduce-axis deben ser distintos")
++
++    rgb_root = Path(args.rgb_root).resolve()
++    sil_root = Path(args.sil_root).resolve() if args.sil_root else None
++    out_root = Path(args.output).resolve()
++
++    sys.path.insert(0, args.vhuman_root)
++    os.chdir(args.vhuman_root)  # config y weights son relativos a vhuman3d_deploy
+ 
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+     print(f"Cargando modelo en {device}...")
+-    model = cargar_modelo(args.config, args.weights, device)
++    model = cargar_modelo(args.config, args.weights, device, args.allow_missing)
+ 
+-    rgb_root = Path(args.rgb_root)
+-    out_root = Path(args.output)
+-    out_root.mkdir(parents=True, exist_ok=True)
++    if args.check:
++        check(model, args, device, rgb_root)
++        return
+ 
+-    sujetos = sorted([d for d in rgb_root.iterdir() if d.is_dir()])
++    out_root.mkdir(parents=True, exist_ok=True)
++    sujetos = sorted(d for d in rgb_root.iterdir() if d.is_dir())
+     if args.max_sujetos > 0:
+         sujetos = sujetos[:args.max_sujetos]
+ 
++    n_ok = n_skip = n_fail = 0
+     for sujeto in sujetos:
+-        for cond in sorted(sujeto.iterdir()):
+-            if not cond.is_dir(): continue
+-            for ang in sorted(cond.iterdir()):
+-                if not ang.is_dir(): continue
+-
+-                frames = sorted(ang.glob("*.png"))
+-                if not frames: continue
+-
+-                feats_secuencia = []
+-                for frame_path in frames:
+-                    rgb_bgr = cv2.imread(str(frame_path))
+-                    if rgb_bgr is None: continue
+-                    rgb_np = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+-                    
+-                    try:
+-                        feat = extraer_tensor_frame(model, rgb_np, device) # [16, 16, 768]
+-                        feats_secuencia.append(feat)
+-                    except Exception as e:
+-                        print(f"  Error en {frame_path.name}: {e}")
+-
+-                if feats_secuencia:
+-                    feats_array = np.stack(feats_secuencia, axis=0)
+-                    
+-                    out_dir = out_root / sujeto.name / cond.name / ang.name
+-                    out_dir.mkdir(parents=True, exist_ok=True)
+-                    np.save(out_dir / "features.npy", feats_array)
+-                    print(f"  {sujeto.name}/{cond.name}/{ang.name}: {feats_array.shape}")
++        for seq in sorted(p for p in sujeto.glob('*/*') if p.is_dir()):
++            rel = seq.relative_to(rgb_root)
++            out_dir = out_root / rel
++            if (out_dir / "features.npy").exists() and not args.overwrite:
++                n_skip += 1
++                continue
++
++            frames = sorted(seq.glob("*.png"))
++            if not frames:
++                continue
++            if sil_root is not None:
++                sil_names = sorted(f.name for f in (sil_root / rel).glob("*.png"))
++                if sil_names != [f.name for f in frames]:
++                    print(f"  [SKIP] {rel}: frames RGB y siluetas no coinciden")
++                    n_fail += 1
++                    continue
++
++            try:
++                feats = []
++                for i in range(0, len(frames), args.batch_size):
++                    chunk = frames[i:i + args.batch_size]
++                    rgb = []
++                    for f in chunk:
++                        img = cv2.imread(str(f))
++                        if img is None:
++                            raise IOError(f"no se pudo leer {f.name}")
++                        rgb.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
++                    vol = volumen_3d(model, preprocesar(rgb, args, device))
++                    feats.append(reducir(vol, args.depth_axis, args.reduce_axis).half().cpu())
++                feats = torch.cat(feats).numpy()             # [T, 16, 768] float16
++            except Exception as e:  # noqa: BLE001
++                print(f"  [FAIL] {rel}: {e} -> secuencia descartada")
++                n_fail += 1
++                continue
++
++            out_dir.mkdir(parents=True, exist_ok=True)
++            tmp = out_dir / "features.tmp.npy"
++            np.save(tmp, feats)
++            tmp.replace(out_dir / "features.npy")           # escritura atómica
++            (out_dir / "frames.txt").write_text("\n".join(f.name for f in frames) + "\n")
++            n_ok += 1
++            print(f"  {rel}: {feats.shape}")
++
++    print(f"\n=== Resumen === OK: {n_ok} | ya existentes: {n_skip} | descartadas: {n_fail}")
+ 
+-if __name__ == "__main__":
+-    main()  
+ 
++if __name__ == "__main__":
++    main()
+diff --git a/data/procesar_casiab_yolo.py b/data/procesar_casiab_yolo.py
+index 4428dae..f23505d 100644
+--- a/data/procesar_casiab_yolo.py
++++ b/data/procesar_casiab_yolo.py
+@@ -22,10 +22,12 @@ CONF_THRESHOLD = 0.3
+ PERSON_CLASS_ID = 0
+ 
+ 
+-def normalizar_con_padding(img, output_size=OUTPUT_SIZE):
++def normalizar_con_padding(img, output_size=OUTPUT_SIZE, interpolation=cv2.INTER_NEAREST):
+     """
+     Normaliza una imagen (silueta o RGB) al tamaño output_size (alto, ancho)
+     manteniendo la proporción y rellenando con negro.
++    Siluetas: INTER_NEAREST (mantiene la máscara binaria).
++    RGB: INTER_AREA al reducir (evita aliasing), INTER_LINEAR al ampliar.
+     """
+     h, w = img.shape[:2]
+     out_h, out_w = output_size
+@@ -36,7 +38,7 @@ def normalizar_con_padding(img, output_size=OUTPUT_SIZE):
+     nuevo_w = max(1, int(w * escala))
+ 
+     img_resized = cv2.resize(img, (nuevo_w, nuevo_h),
+-                             interpolation=cv2.INTER_NEAREST)
++                             interpolation=interpolation)
+ 
+     # Crear lienzo negro
+     if len(img.shape) == 2:
+@@ -123,7 +125,12 @@ def main():
+                         help="Carpeta destino")
+     parser.add_argument("--max-sujetos", type=int, default=0,
+                         help="Procesar solo N sujetos (0=todos, útil para pruebas)")
++    parser.add_argument("--rgb-size", type=int, nargs=2, metavar=("H", "W"),
++                        default=list(OUTPUT_SIZE),
++                        help="Tamaño del RGB para el maestro (por defecto igual a la silueta). "
++                             "Ajustar a la resolución de entrada de VHuman3D.")
+     args = parser.parse_args()
++    rgb_size = tuple(args.rgb_size)
+ 
+     in_root = Path(args.input)
+     out_root = Path(args.output)
+@@ -176,7 +183,10 @@ def main():
+                         continue
+ 
+                     # Normalizar ambos al mismo tamaño
+-                    rgb_norm = normalizar_con_padding(rgb_crop, OUTPUT_SIZE)
++                    reduce = rgb_crop.shape[0] > rgb_size[0]
++                    rgb_norm = normalizar_con_padding(
++                        rgb_crop, rgb_size,
++                        cv2.INTER_AREA if reduce else cv2.INTER_LINEAR)
+                     sil_norm = normalizar_con_padding(sil_crop, OUTPUT_SIZE)
+ 
+                     # Guardar con el mismo nombre base
+diff --git a/losses/distillation_loss.py b/losses/distillation_loss.py
+index 0afac88..8d09d9a 100644
+--- a/losses/distillation_loss.py
++++ b/losses/distillation_loss.py
+@@ -1,47 +1,56 @@
+ import torch
+-import torch.nn as nn
+ import torch.nn.functional as F
+ 
+-class DistillationLoss(nn.Module):
+-    def __init__(self, w_l1=1.0, w_cos=1.0, beta=1.0):
+-        super(DistillationLoss, self).__init__()
+-        self.w_l1 = w_l1
+-        self.w_cos = w_cos
+-        self.beta = beta
+-        # OpenGait necesita este atributo para ponderar la pérdida
+-        self.loss_term_weight = 1.0
+-
+-    def forward(self, student_feat, teacher_feat):
+-        # --- PRINT DE DEPURACIÓN (Opcional, puedes quitarlo luego) ---
+-        # print(f"DEBUG Loss - student: {student_feat.shape}, teacher: {teacher_feat.shape}")
+-        
+-        # 1. Smooth L1 Loss (Huber Loss)
+-        # Es robusto a outliers, ideal para alinear la magnitud
+-        loss_l1 = F.smooth_l1_loss(student_feat, teacher_feat, beta=self.beta, reduction='mean')
+-
+-        # 2. Cosine Distance Loss (Alineación Direccional)
+-        # Añadimos eps para evitar división por cero si un vector es todo ceros
+-        eps = 1e-8
+-        s_norm = student_feat / (student_feat.norm(p=2, dim=-1, keepdim=True) + eps)
+-        t_norm = teacher_feat / (teacher_feat.norm(p=2, dim=-1, keepdim=True) + eps)
+-        
+-        # Producto punto para similitud coseno
+-        cos_sim = (s_norm * t_norm).sum(dim=-1)
+-        
+-        # Clampeamos para asegurar que está en [-1, 1] y evitar NaNs numéricos
+-        cos_sim = torch.clamp(cos_sim, -1.0 + eps, 1.0 - eps)
+-        
+-        # Distancia coseno = 1 - similitud
+-        loss_cos = 1.0 - cos_sim.mean()
+-
+-        # 3. Pérdida total ponderada
+-        total_loss = self.w_l1 * loss_l1 + self.w_cos * loss_cos
+-
+-        # 4. Diccionario de métricas para TensorBoard
++from .base import BaseLoss
++
++
++class DistillationLoss(BaseLoss):
++    """
++    Smooth L1 (magnitud) + distancia coseno (dirección) entre estudiante y maestro.
++
++    student_feat, teacher_feat : [N, T, P, D]
++    mask                       : [N, T] bool, True = frame con maestro válido.
++                                 Los frames enmascarados no aportan pérdida ni gradiente.
++    teacher_norm               : 'none' | 'layernorm'. 'layernorm' normaliza el maestro por
++                                 token (sin parámetros); útil si no se usan teacher_stats.
++    """
++
++    def __init__(self, w_l1=1.0, w_cos=1.0, beta=1.0, teacher_norm='none',
++                 loss_term_weight=1.0):
++        super().__init__(loss_term_weight)
++        if teacher_norm not in ('none', 'layernorm'):
++            raise ValueError(f"teacher_norm no soportado: {teacher_norm}")
++        self.w_l1, self.w_cos, self.beta = w_l1, w_cos, beta
++        self.teacher_norm = teacher_norm
++
++    def forward(self, student_feat, teacher_feat, mask=None):
++        s = student_feat.float()                      # fuera de autocast: cálculo en fp32
++        t = teacher_feat.float()
++        if self.teacher_norm == 'layernorm':
++            t = F.layer_norm(t, t.shape[-1:])
++
++        if mask is None:
++            mask = torch.ones(s.shape[:2], dtype=torch.bool, device=s.device)
++        m = mask.to(s.device).float()                 # [N, T]
++        n_valid = m.sum()
++
++        l1 = F.smooth_l1_loss(s, t, beta=self.beta, reduction='none').mean(dim=(-1, -2))  # [N, T]
++        cos = F.cosine_similarity(s, t, dim=-1, eps=1e-6).mean(dim=-1)                    # [N, T]
++
++        if n_valid == 0:  # batch sin maestro: pérdida nula pero conectada al grafo
++            zero = s.sum() * 0.0
++            return zero, {'loss_l1': zero.detach(), 'loss_cos': zero.detach(),
++                          'cos_sim': zero.detach(), 'valid_ratio': zero.detach()}
++
++        loss_l1 = (l1 * m).sum() / n_valid
++        cos_sim = (cos * m).sum() / n_valid
++        loss_cos = 1.0 - cos_sim
++        total = self.w_l1 * loss_l1 + self.w_cos * loss_cos
++
+         info = {
+             'loss_l1': loss_l1.detach(),
+-            'loss_cos': loss_cos.detach()
++            'loss_cos': loss_cos.detach(),
++            'cos_sim': cos_sim.detach(),
++            'valid_ratio': (n_valid / m.numel()).detach(),
+         }
+-        
+-        # OpenGait espera una tupla (loss_total, info_dict)
+-        return total_loss, info
++        return total, info
+diff --git a/models/student_distill.py b/models/student_distill.py
+index 03c88b8..8af97e5 100644
+--- a/models/student_distill.py
++++ b/models/student_distill.py
+@@ -1,135 +1,150 @@
++import numpy as np
+ import torch
+ import torch.nn as nn
++import torch.utils.data as tordata
++
+ from ..base_model import BaseModel
+-from ..modules import HorizontalPoolingPyramid, PackSequenceWrapper, SeparateFCs, SeparateBNNecks, conv1x1, conv3x3, BasicBlock2D
++from ..modules import HorizontalPoolingPyramid, SeparateFCs, SeparateBNNecks, conv1x1, conv3x3, BasicBlock2D
++
++import data.sampler as Samplers
++from utils import get_attr_from, get_valid_args
++
+ 
+ class StudentDistill(BaseModel):
+     """
+     Estudiante para Feature Distillation basado en DeepGaitV2-2D.
+-    - Backbone: 2D (procesa frames individuales).
+-    - Extracción: Usa HPP para obtener 16 partes horizontales.
+-    - Cabeza de proyección: MLP 2 capas que mapea cada parte a 768 dims.
++    - Backbone 2D por frame + HPP de 16 franjas horizontales.
++    - proj_head (MLP 2 capas) -> [N, T, 16, 768]; se descarta tras el entrenamiento.
++    - Opcional (model_cfg.recognition_losses): ramas Triplet/CE como regularizador.
++
++    Esta clase define su propio get_loader e inputs_pretreament, por lo que no
++    hace falta parchear OpenGait (ni monkeypatching ni cambios en ts2var).
+     """
+ 
+-    def build_network(self, model_cfg):
+-        mode = '2d'
+-        block = BasicBlock2D
++    # ------------------------------------------------------------------ #
++    #  Datos
++    # ------------------------------------------------------------------ #
++    def get_loader(self, data_cfg, train=True):
++        from distillation_dataset import DistillationDataSet
++        from distillation_collate import DistillationCollateFn
++
++        sampler_cfg = self.cfgs['trainer_cfg']['sampler'] if train else self.cfgs['evaluator_cfg']['sampler']
++        dataset = DistillationDataSet(data_cfg, train)
++
++        Sampler = get_attr_from([Samplers], sampler_cfg['type'])
++        valid_args = get_valid_args(Sampler, sampler_cfg, free_keys=['sample_type', 'type'])
++        sampler = Sampler(dataset, **valid_args)
++
++        collate = DistillationCollateFn(
++            dataset.label_set, sampler_cfg,
++            teacher_stats=data_cfg.get('teacher_stats'),
++            legacy_reduce_axis=data_cfg.get('legacy_reduce_axis', 0))
++
++        num_workers = data_cfg['num_workers']
++        return tordata.DataLoader(
++            dataset=dataset, batch_sampler=sampler, collate_fn=collate,
++            num_workers=num_workers, pin_memory=True,
++            persistent_workers=num_workers > 0,
++            prefetch_factor=2 if num_workers > 0 else None)
++
++    def inputs_pretreament(self, inputs):
++        seqs_batch, labs_batch, typs_batch, vies_batch, seqL_batch, teacher, mask = inputs
++        seq_trfs = self.trainer_trfs if self.training else self.evaluator_trfs
++        if len(seqs_batch) != len(seq_trfs):
++            raise ValueError(f"Número de entradas ({len(seqs_batch)}) != número de transforms ({len(seq_trfs)})")
++
++        # Sin requires_grad en las entradas: no se necesita gradiente respecto a la silueta.
++        seqs = [torch.from_numpy(np.asarray([trf(fra) for fra in seq], dtype=np.float32))
++                .cuda(non_blocking=True) for trf, seq in zip(seq_trfs, seqs_batch)]
++        labs = torch.as_tensor(labs_batch, dtype=torch.long).cuda(non_blocking=True)
++
++        seqL = None
++        if seqL_batch is not None:
++            seqL = torch.from_numpy(seqL_batch).int().cuda(non_blocking=True)
++            seqs = [s[:, :int(seqL.sum())] for s in seqs]
++
++        if teacher is not None:
++            teacher = teacher.cuda(non_blocking=True).float()
++            mask = mask.cuda(non_blocking=True)
++        return seqs, labs, typs_batch, vies_batch, seqL, teacher, mask
+ 
++    # ------------------------------------------------------------------ #
++    #  Red
++    # ------------------------------------------------------------------ #
++    def build_network(self, model_cfg):
+         in_channels = model_cfg['Backbone']['in_channels']
+         layers = model_cfg['Backbone']['layers']
+         channels = model_cfg['Backbone']['channels']
+         self.inference_use_emb2 = model_cfg.get('use_emb2', False)
++        self.use_recognition = model_cfg.get('recognition_losses', False)
++        self.parts = 16
++        self.teacher_dim = model_cfg.get('teacher_dim', 768)
++        proj_hidden = model_cfg.get('proj_hidden', 1024)
+ 
+         strides = [[1, 1], [2, 2], [2, 2], [1, 1]]
+-
+         self.inplanes = channels[0]
+-        # NOTA: Ya no usamos SetBlockWrapper
+         self.layer0 = nn.Sequential(
+             conv3x3(in_channels, self.inplanes, 1),
+             nn.BatchNorm2d(self.inplanes),
+-            nn.ReLU(inplace=True)
+-        )
+-        self.layer1 = self.make_layer(BasicBlock2D, channels[0], strides[0], blocks_num=layers[0], mode=mode)
+-        self.layer2 = self.make_layer(BasicBlock2D, channels[1], strides[1], blocks_num=layers[1], mode=mode)
+-        self.layer3 = self.make_layer(BasicBlock2D, channels[2], strides[2], blocks_num=layers[2], mode=mode)
+-        self.layer4 = self.make_layer(BasicBlock2D, channels[3], strides[3], blocks_num=layers[3], mode=mode)
+-
+-        # Cabezas de reconocimiento estándar
+-        self.FCs = SeparateFCs(16, channels[3], channels[2])
+-        self.BNNecks = SeparateBNNecks(16, channels[2],
+-                                       class_num=model_cfg['SeparateBNNecks']['class_num'])
+-
+-        self.TP = PackSequenceWrapper(torch.max)
+-        self.HPP = HorizontalPoolingPyramid(bin_num=[16])
++            nn.ReLU(inplace=True))
++        self.layer1 = self.make_layer(BasicBlock2D, channels[0], strides[0], layers[0])
++        self.layer2 = self.make_layer(BasicBlock2D, channels[1], strides[1], layers[1])
++        self.layer3 = self.make_layer(BasicBlock2D, channels[2], strides[2], layers[2])
++        self.layer4 = self.make_layer(BasicBlock2D, channels[3], strides[3], layers[3])
+ 
+-        # --- Cabeza de proyección (C_out -> 768) ---
+-        C_out = channels[3] 
+-        D_out = 768
+-        
++        self.HPP = HorizontalPoolingPyramid(bin_num=[self.parts])
+         self.proj_head = nn.Sequential(
+-            nn.Linear(C_out, 1024),
++            nn.Linear(channels[3], proj_hidden),
+             nn.ReLU(inplace=True),
+-            nn.Linear(1024, D_out), 
+-        )
++            nn.Linear(proj_hidden, self.teacher_dim))
+ 
+-    def make_layer(self, block, planes, stride, blocks_num, mode='2d'):
++        # Ramas de reconocimiento (se mantienen para checkpoints/fase 2).
++        self.FCs = SeparateFCs(self.parts, channels[3], channels[2])
++        self.BNNecks = SeparateBNNecks(self.parts, channels[2],
++                                       class_num=model_cfg['SeparateBNNecks']['class_num'])
++
++    def make_layer(self, block, planes, stride, blocks_num):
+         if max(stride) > 1 or self.inplanes != planes * block.expansion:
+             downsample = nn.Sequential(
+-                conv1x1(self.inplanes, planes * block.expansion, stride=stride), 
+-                nn.BatchNorm2d(planes * block.expansion)
+-            )
++                conv1x1(self.inplanes, planes * block.expansion, stride=stride),
++                nn.BatchNorm2d(planes * block.expansion))
+         else:
+             downsample = lambda x: x
+         layers = [block(self.inplanes, planes, stride=stride, downsample=downsample)]
+         self.inplanes = planes * block.expansion
+-        for i in range(1, blocks_num):
++        for _ in range(1, blocks_num):
+             layers.append(block(self.inplanes, planes, stride=[1, 1]))
+         return nn.Sequential(*layers)
+ 
++    def _recognition_head(self, out, N, T):
++        out = out.view(N, T, *out.shape[1:])     # [N, T, C, H', W']
++        out = out.max(dim=1)[0]                  # pooling temporal
++        return self.FCs(self.HPP(out))           # [N, C_fc, 16]
++
+     def forward(self, inputs):
+-        #1. Desempaquetar (6 elementos)
+-        ipts, labs, typs, vies, seqL, teacher_feat = inputs
+-        
+-        # ipts[0]: [N, T, H, W]
+-        sils = ipts[0]
++        ipts, labs, typs, vies, seqL, teacher_feat, mask = inputs
++        sils = ipts[0]                           # [N, T, H, W]
+         N, T, H, W = sils.shape
+-        
+-        # Aplanar para convoluciones 2D
+-        sils = sils.view(N * T, 1, H, W) # [N*T, 1, H, W]
+-        
+-        # --- 1. Backbone ---
+-        out = self.layer0(sils)
+-        out = self.layer1(out)
+-        out = self.layer2(out)
+-        out = self.layer3(out)
+-        out = self.layer4(out) # [N*T, C4, H', W']
+-        
+-        # --- 2. Extracción de Features para Destilación (HPP) ---
+-        hpp_out = self.HPP(out) # [N*T, C4, 16, 1]
+-        feat_hpp = hpp_out.squeeze(-1).permute(0, 2, 1).contiguous() # [N*T, 16, C4]
+-        
+-        # Cabeza de proyección
+-        proj = self.proj_head(feat_hpp) # [N*T, 16, 768]
+-        proj = proj.view(N, T, 16, 768) # [N, T, 16, 768]
+-
+-
+-        if self.training:
+-            # --- 3. Features de reconocimiento (para Triplet/Softmax) ---
+-            # Reconstruir la dimensión temporal para el TP
+-            out = out.view(N, T, *out.shape[1:]) # [N, T, C4, H', W']
+-
+-            
+-            # TP espera [N, T, C, H, W] y hace max sobre T
+-            out_rec, _ = torch.max(out, dim=1) # [N, C4, H', W']
+-            
+-            out_rec = self.HPP(out_rec) # [N, C4, 16, 1]
+-            feat_rec = self.FCs(out_rec) # [N, C_fc, 16, 1]
+-            
+-            retval = {
+-                'training_feat': {
+-                    'distill': {
+-                        'student_feat': proj, # [N, T, 16, 768]
+-                        'teacher_feat': teacher_feat, # [N, T, 16, 768]
+-                    },
+-                    'triplet': {'embeddings': feat_rec, 'labels': labs},
+-                    'softmax': {'logits': feat_rec, 'labels': labs},
+-                },
+-                'visual_summary': {},
+-                'inference_feat': {}
+-
+-            }
+-        else:
+-            # --- Inferencia: solo backbone ---
+-            out = out.view(N, T, *out.shape[1:]) # [N, T, C4, H', W']
+-            out_rec, _ = torch.max(out, dim=1)
+-            out_rec = self.HPP(out_rec)
+-            feat_rec = self.FCs(out_rec)
+-            embeddings = self.BNNecks(feat_rec)[0] if not self.inference_use_emb2 else feat_rec
+-            
+-            retval = {
+-                'training_feat': {},
+-                'inference_feat': {
+-                    'embeddings': embeddings,
+-                }
+-            }
+-        return retval
++
++        out = sils.view(N * T, 1, H, W)
++        out = self.layer4(self.layer3(self.layer2(self.layer1(self.layer0(out)))))  # [N*T, C4, H', W']
++
++        if not self.training:
++            feat_rec = self._recognition_head(out, N, T)
++            embeddings = feat_rec if self.inference_use_emb2 else self.BNNecks(feat_rec)[0]
++            return {'training_feat': {}, 'visual_summary': {},
++                    'inference_feat': {'embeddings': embeddings}}
++
++        feat_hpp = self.HPP(out).permute(0, 2, 1)            # [N*T, 16, C4]
++        proj = self.proj_head(feat_hpp).view(N, T, self.parts, self.teacher_dim)
++
++        training_feat = {
++            'distill': {'student_feat': proj, 'teacher_feat': teacher_feat, 'mask': mask},
++        }
++        if self.use_recognition:
++            embed_1 = self._recognition_head(out, N, T)
++            _, logits = self.BNNecks(embed_1)
++            training_feat['triplet'] = {'embeddings': embed_1, 'labels': labs}
++            training_feat['softmax'] = {'logits': logits, 'labels': labs}
++
++        return {'training_feat': training_feat, 'visual_summary': {}, 'inference_feat': {}}
+diff --git a/scripts/install_into_opengait.sh b/scripts/install_into_opengait.sh
+new file mode 100755
+index 0000000..40848a4
+--- /dev/null
++++ b/scripts/install_into_opengait.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# Enlaza el modelo y la pérdida de este repo dentro de OpenGait (registro automático de clases).
++# Usa enlaces simbólicos: editar en el repo se refleja en OpenGait sin volver a copiar.
++set -euo pipefail
++
++DISTILL_ROOT="${DISTILL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
++OPENGAIT_ROOT="${OPENGAIT_ROOT:-/opt3/data/julieta/OpenGait}"
++
++link() {
++  local src="$1" dst="$2"
++  if [ -e "$dst" ] && [ ! -L "$dst" ]; then
++    mv "$dst" "$dst.bak.$(date +%Y%m%d%H%M%S)"
++    echo "Copia previa respaldada: $dst.bak.*"
++  fi
++  ln -sfn "$src" "$dst"
++  echo "$dst -> $src"
++}
++
++link "$DISTILL_ROOT/models/student_distill.py"  "$OPENGAIT_ROOT/opengait/modeling/models/student_distill.py"
++link "$DISTILL_ROOT/losses/distillation_loss.py" "$OPENGAIT_ROOT/opengait/modeling/losses/distillation_loss.py"
+diff --git a/scripts/train_distill.py b/scripts/train_distill.py
+index 6cf59d3..7638b6b 100644
+--- a/scripts/train_distill.py
++++ b/scripts/train_distill.py
+@@ -1,35 +1,39 @@
+-import sys
+-import os
+-import runpy
+-import numpy as np
+-import torch
++"""
++Lanzador de la destilación sobre OpenGait, sin monkeypatching.
+ 
+-sys.path.insert(0, "/opt3/data/julieta/OpenGait")
+-sys.path.insert(0, "/opt3/data/julieta/OpenGait/opengait")
+-sys.path.insert(0, "/opt3/data/julieta/OpenGait/lib")
+-sys.path.insert(0, "/opt3/data/julieta/gait-distillation/data")
++StudentDistill define su propio get_loader e inputs_pretreament, así que aquí
++solo se preparan las rutas y se ejecuta opengait/main.py tal cual.
+ 
+-os.chdir("/opt3/data/julieta/OpenGait")
++Requisito previo (una vez): scripts/install_into_opengait.sh
++Uso:
++    python -m torch.distributed.run --nproc_per_node=1 scripts/train_distill.py \
++        --cfgs <repo>/configs/student_distill_casiab.yaml --phase train --log_to_file
+ 
+-import opengait.data.dataset
+-import opengait.data.collate_fn
+-import opengait.data
+-import opengait.modeling.base_model
++Rutas configurables con OPENGAIT_ROOT y DISTILL_ROOT.
++"""
++import os
++import runpy
++import sys
++from pathlib import Path
+ 
+-from distillation_dataset import DistillationDataSet
+-from distillation_collate import DistillationCollateFn
++DISTILL_ROOT = Path(os.environ.get("DISTILL_ROOT", Path(__file__).resolve().parents[1]))
++OPENGAIT_ROOT = Path(os.environ.get("OPENGAIT_ROOT", "/opt3/data/julieta/OpenGait"))
+ 
+-opengait.data.dataset.DataSet = DistillationDataSet
+-if hasattr(opengait.data, 'DataSet'):
+-    opengait.data.DataSet = DistillationDataSet
++# Resolver --cfgs a ruta absoluta antes del chdir (OpenGait trabaja relativo a su raíz).
++if "--cfgs" in sys.argv:
++    i = sys.argv.index("--cfgs") + 1
++    sys.argv[i] = str(Path(sys.argv[i]).resolve())
+ 
++# Solo la carpeta data/ del repo (no la raíz): evita colisión con el paquete 'data' de OpenGait.
++sys.path.insert(0, str(DISTILL_ROOT / "data"))
++sys.path.insert(0, str(OPENGAIT_ROOT / "opengait"))
++os.chdir(OPENGAIT_ROOT)
+ 
+-opengait.data.collate_fn.CollateFn = DistillationCollateFn
+-if hasattr(opengait.data, 'CollateFn'):
+-    opengait.data.CollateFn = DistillationCollateFn
+-if hasattr(opengait.modeling.base_model, 'CollateFn'):
+-    opengait.modeling.base_model.CollateFn = DistillationCollateFn
++for rel in ("opengait/modeling/models/student_distill.py",
++            "opengait/modeling/losses/distillation_loss.py"):
++    if not (OPENGAIT_ROOT / rel).exists():
++        sys.exit(f"Falta {rel} en OpenGait. Ejecuta scripts/install_into_opengait.sh")
+ 
+ if __name__ == "__main__":
+-    runpy.run_path("/opt3/data/julieta/OpenGait/opengait/main.py", run_name="__main__")
+-
++    sys.argv[0] = str(OPENGAIT_ROOT / "opengait" / "main.py")
++    runpy.run_path(sys.argv[0], run_name="__main__")
+-- 
+2.43.0
+
+
+From 9506b489a299d74c8e99b096a8680a05069616c4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Xavier=20P=C3=A9rez?=
+ <franciscoxavier.perez.sanjuan@gmail.com>
+Date: Thu, 29 Oct 2026 10:59:24 +0100
+Subject: [PATCH 2/3] =?UTF-8?q?Ajusta=20la=20extracci=C3=B3n=20del=20maest?=
+ =?UTF-8?q?ro=20a=20las=20convenciones=20de=20VHuman3D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Usa model.get_features (API oficial) en lugar de reimplementar el forward.
+- Entrada NHWC en [0,1] confirmada; se eliminan --layout/--normalize/--input-size.
+- Relleno a cuadrado (--pad-factor, como pad_cropped_image del demo):
+  preprocessing redimensiona a 518x518 sin conservar proporción.
+- Claves backbone.* ausentes del checkpoint se aceptan (DINOv2 de torch hub)
+  y se informa si los pesos están en caché; se aborta solo si faltan otras.
+- --check mide la extensión del cuerpo predicho por eje y en las 16 franjas.
+- procesar_casiab_yolo: --rgb-pad-factor para guardar el RGB ya cuadrado.
+- Ejes G0/G1/G2 documentados según plot_3d: la reducción original era correcta.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WK6ob9J25CSVfCkuYYaVq8
+---
+ README.md                       |  13 ++-
+ data/extraer_features_vhuman.py | 150 +++++++++++++++++---------------
+ data/procesar_casiab_yolo.py    |  29 +++++-
+ 3 files changed, 114 insertions(+), 78 deletions(-)
+
+diff --git a/README.md b/README.md
+index 05a154e..4ec5bff 100644
+--- a/README.md
++++ b/README.md
+@@ -31,7 +31,14 @@ Prueba rápida con 5 sujetos: `dataset_partition: <repo>/configs/CASIA-B-debug5.
+ - Sin augmentaciones geométricas: el maestro está precalculado.
+ - El maestro se lee con `mmap_mode='r'`: solo se leen del disco los frames muestreados.
+ 
+-## Pendiente de verificar con el código de VHuman3D
++## Maestro (VHuman3D): convenciones verificadas en su código
+ 
+-`--layout`, `--normalize`, `--input-size` y los ejes `--depth-axis/--reduce-axis` de la
+-extracción. Los valores por defecto reproducen el comportamiento original.
++- Entrada NHWC, RGB en [0, 1]; `preprocessing` redimensiona a 518×518 y normaliza internamente.
++- `preprocessing` no conserva proporción: el RGB se rellena a cuadrado (`--pad-factor`, 1.2 como el demo).
++- Rejilla 16³: G0 horizontal, G1 vertical (0 = arriba), G2 profundidad (según `plot_3d` del demo).
++  Max sobre G2 + mean sobre G0 → 16 franjas verticales, como la HPP del estudiante.
++- `model_clean.pt` no incluye `backbone.*` (DINOv2 congelada desde torch hub): es esperado.
++- `--check` mide qué franjas ocupa el cuerpo predicho para comprobar la alineación vertical.
++
++Recomendado: regenerar el RGB con `procesar_casiab_yolo.py --rgb-size 256 256 --rgb-pad-factor 1.2`
++(las siluetas no cambian) para no ampliar 64 px a 518 px.
+diff --git a/data/extraer_features_vhuman.py b/data/extraer_features_vhuman.py
+index 0e39bbb..68f2846 100644
+--- a/data/extraer_features_vhuman.py
++++ b/data/extraer_features_vhuman.py
+@@ -6,15 +6,16 @@ Salida por secuencia (<out>/<pid>/<cond>/<view>/):
+     features.npy : float16 [T, 16, 768]   (antes float32 [T, 16, 16, 768], ~32x más grande)
+     frames.txt   : nombres de los T frames, en el mismo orden que el .pkl de siluetas
+ 
+-Reducción de la rejilla 3D [G0, G1, G2, C] -> [16, C]:
+-    --depth-axis : eje de la rejilla que se reduce con max  (antes: 2, vol.max(dim=3))
+-    --reduce-axis: eje de la rejilla que se reduce con mean (antes: 0, mean(dim=1) en el collate)
+-    El eje restante debe ser el VERTICAL (altura), para corresponder con las 16 franjas
+-    horizontales de la HPP del estudiante. Verificar con --check y el código de VHuman3D.
++Entrada al modelo (según model_builder.py y demo.py de VHuman3D):
++    - NHWC, RGB, float en [0, 1]; forward_backbone hace movedim y preprocessing
++      redimensiona a 518x518 y normaliza internamente.
++    - preprocessing NO conserva la proporción: la imagen se rellena antes a un
++      cuadrado de pad_factor x lado mayor, igual que pad_cropped_image() del demo.
+ 
+-Preprocesado de entrada (pendiente de confirmar con el código de VHuman3D):
+-    --layout nhwc|nchw, --normalize none|imagenet, --input-size H W
+-    Los valores por defecto reproducen el comportamiento original.
++Rejilla 3D [G0, G1, G2, C] (convención de plot_3d del demo):
++    G0 = horizontal, G1 = vertical (índice 0 arriba), G2 = profundidad.
++    Por defecto: max sobre G2 (--depth-axis 2) y mean sobre G0 (--reduce-axis 0),
++    quedan 16 franjas verticales como en la HPP del estudiante.
+ 
+ Robustez:
+     - Si falla un solo frame, la secuencia completa se descarta (evita desalinear índices).
+@@ -30,57 +31,56 @@ import cv2
+ import numpy as np
+ import torch
+ 
+-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+-
+ 
+ def cargar_modelo(config_path, weights_path, device, allow_missing=False):
+     from vhuman3d.architectures import model_builder
+     model = model_builder(config_path).to(device)
+     state = torch.load(weights_path, map_location=device, weights_only=True)
+     res = model.load_state_dict(state, strict=False)
+-    print(f"[load] missing keys: {len(res.missing_keys)} | unexpected keys: {len(res.unexpected_keys)}")
+-    for k in res.missing_keys[:20]:
++
++    # La DINOv2 congelada no viaja en model_clean.pt: la aporta dinov2_vitb14_reg() desde torch hub.
++    miss_bb = [k for k in res.missing_keys if k.startswith("backbone.")]
++    miss_other = [k for k in res.missing_keys if not k.startswith("backbone.")]
++    print(f"[load] missing backbone.*: {len(miss_bb)} | missing otras: {len(miss_other)} "
++          f"| unexpected: {len(res.unexpected_keys)}")
++    for k in miss_other[:20]:
+         print(f"   missing   : {k}")
+     for k in res.unexpected_keys[:20]:
+         print(f"   unexpected: {k}")
+-    if res.missing_keys and not allow_missing:
+-        sys.exit("[load] Hay pesos sin cargar: el maestro estaría parcialmente aleatorio. "
+-                 "Revisa el checkpoint o usa --allow-missing si es intencionado.")
++    if miss_bb:
++        ckpts = sorted((Path(torch.hub.get_dir()) / "checkpoints").glob("dinov2_vitb14_reg*"))
++        print(f"[load] DINOv2 desde torch hub: {[c.name for c in ckpts] or 'NO ENCONTRADO en caché'}")
++    if miss_other and not allow_missing:
++        sys.exit("[load] Hay pesos del decoder 3D sin cargar: el maestro estaría parcialmente "
++                 "aleatorio. Revisa el checkpoint o usa --allow-missing si es intencionado.")
+     model.eval()
+     return model
+ 
+ 
+-def preprocesar(rgb_list, args, device):
+-    """Lista de RGB uint8 [H, W, 3] -> tensor [B, 3, H, W] o [B, H, W, 3]."""
+-    out = []
+-    for img in rgb_list:
+-        if args.input_size:
+-            h, w = args.input_size
+-            interp = cv2.INTER_AREA if img.shape[0] > h else cv2.INTER_LINEAR
+-            img = cv2.resize(img, (w, h), interpolation=interp)
+-        x = img.astype(np.float32) / 255.0
+-        if args.normalize == 'imagenet':
+-            x = (x - IMAGENET_MEAN) / IMAGENET_STD
+-        out.append(x)
+-    x = torch.from_numpy(np.stack(out)).to(device)          # [B, H, W, 3]
+-    if args.layout == 'nchw':
+-        x = x.permute(0, 3, 1, 2).contiguous()
+-    return x
++def pad_cuadrado(img, pad_factor):
++    """Réplica de pad_cropped_image() del demo: centra en un cuadrado de pad_factor x lado mayor."""
++    h, w = img.shape[:2]
++    side = int(max(h, w) * pad_factor)
++    canvas = np.zeros((side, side, img.shape[2]), dtype=img.dtype)
++    oy, ox = (side - h) // 2, (side - w) // 2
++    canvas[oy:oy + h, ox:ox + w] = img
++    return canvas
++
++
++def preprocesar(rgb_list, pad_factor, device):
++    """Lista de RGB uint8 [H, W, 3] -> tensor NHWC float [B, S, S, 3] en [0, 1]."""
++    imgs = [img if img.shape[0] == img.shape[1] else pad_cuadrado(img, pad_factor) for img in rgb_list]
++    side = max(i.shape[0] for i in imgs)
++    imgs = [i if i.shape[0] == side else cv2.resize(i, (side, side), interpolation=cv2.INTER_LINEAR)
++            for i in imgs]
++    return torch.from_numpy(np.stack(imgs).astype(np.float32) / 255.0).to(device)
+ 
+ 
+ @torch.no_grad()
+ def volumen_3d(model, x):
+-    """Reproduce el forward interno del maestro hasta el volumen [B, G0, G1, G2, C]."""
+-    feats = model.forward_backbone(x)
+-    feats = model.backbone_projection(feats)
+-    feats = feats + model.backbone_pos.unsqueeze(0).expand(feats.shape[0], -1, -1)
+-
+-    # repeat (no expand): el decoder podría operar in-place sobre las queries
+-    vol = (model.embeddings_3d + model.pos_encoding).unsqueeze(0).repeat(feats.shape[0], 1, 1)
+-    for layer in model.decoder_3d:
+-        vol = layer(vol, feats)
+-    return vol.reshape(vol.shape[0], *model.init_3d_grid_shape, model.embedding_dim_3d)
++    """Tokens del decoder 3D (API oficial get_features) -> [B, G0, G1, G2, C]."""
++    tokens = model.get_features(x)                                  # [B, G0*G1*G2, C]
++    return tokens.reshape(tokens.shape[0], *model.init_3d_grid_shape, model.embedding_dim_3d)
+ 
+ 
+ def reducir(vol, depth_axis, reduce_axis):
+@@ -91,27 +91,34 @@ def reducir(vol, depth_axis, reduce_axis):
+     return vol.mean(dim=r)
+ 
+ 
+-def check(model, args, device, rgb_root):
++@torch.no_grad()
++def check(model, device, rgb_root, pads):
++    """Diagnóstico: extensión del cuerpo predicho por eje y su posición en las 16 franjas verticales."""
+     print(f"[check] init_3d_grid_shape = {tuple(model.init_3d_grid_shape)}, "
+           f"embedding_dim_3d = {model.embedding_dim_3d}")
+-    seq = next(p for p in sorted(rgb_root.glob('*/*/*')) if p.is_dir() and any(p.glob('*.png')))
+-    frames = sorted(seq.glob('*.png'))[:8]
++    seqs = sorted(p for p in rgb_root.glob("*/nm-01/090") if any(p.glob("*.png"))) or \
++        sorted(p for p in rgb_root.glob("*/*/*") if p.is_dir() and any(p.glob("*.png")))
++    frames = sorted(seqs[0].glob("*.png"))
++    frames = [frames[i] for i in np.linspace(0, len(frames) - 1, 8).astype(int)]
+     rgb = [cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB) for f in frames]
+-    print(f"[check] secuencia: {seq} | frame original {rgb[0].shape}")
+-    for layout in ('nhwc', 'nchw'):
+-        args.layout = layout
+-        try:
+-            vol = volumen_3d(model, preprocesar(rgb, args, device))
+-            print(f"[check] layout={layout}: vol {tuple(vol.shape)}, media={vol.mean():.4f}, "
+-                  f"std={vol.std():.4f}, std entre frames={vol.std(dim=0).mean():.4f}")
+-            # Varianza por eje: el eje vertical debería mostrar estructura (varianza alta).
+-            for ax in range(3):
+-                dims = tuple(i + 1 for i in range(3) if i != ax)
+-                prof = vol.float().norm(dim=-1).mean(dim=(0,) + dims)
+-                print(f"         perfil de norma a lo largo del eje {ax}: "
+-                      f"{np.round(prof.cpu().numpy(), 2).tolist()}")
+-        except Exception as e:  # noqa: BLE001
+-            print(f"[check] layout={layout}: ERROR -> {type(e).__name__}: {e}")
++    print(f"[check] secuencia: {seqs[0]} | frame RGB guardado: {rgb[0].shape}")
++
++    for pad in pads:
++        x = preprocesar(rgb, pad, device)
++        segm, _ = model(x)                                          # [B, 11, 64, 64, 64]
++        occ = segm.argmax(dim=1) != 0                               # [B, 64, 64, 64]
++        print(f"[check] pad_factor={pad}: entrada {tuple(x.shape)} | vóxeles ocupados/frame = "
++              f"{occ.flatten(1).sum(1).float().mean():.0f}")
++        for ax in range(3):
++            dims = tuple(d for d in (1, 2, 3) if d != ax + 1)
++            prof = occ.any(dim=dims[1]).any(dim=dims[0])             # [B, 64]
++            lo = [int(p.nonzero()[0]) if p.any() else -1 for p in prof]
++            hi = [int(p.nonzero()[-1]) if p.any() else -1 for p in prof]
++            print(f"         eje {ax}: extensión media {np.mean(np.subtract(hi, lo)) + 1:.1f}/64 vóxeles"
++                  f" | rango medio [{np.mean(lo):.1f}, {np.mean(hi):.1f}]"
++                  f" -> franjas 16 [{np.mean(lo) / 4:.1f}, {np.mean(hi) / 4:.1f}]")
++    print("[check] Esperado: eje 1 = vertical (mayor extensión). Si las franjas del eje 1 no cubren "
++          "~[0, 15], el cuerpo no ocupa toda la altura de la rejilla y conviene ajustar --pad-factor.")
+ 
+ 
+ def main():
+@@ -124,10 +131,10 @@ def main():
+     p.add_argument("--config", default="vhuman3d/architectures/configs/vhuman3d_vitb.json")
+     p.add_argument("--weights", default="runs/run_1778669751/model_clean.pt")
+     p.add_argument("--max-sujetos", type=int, default=0)
+-    p.add_argument("--batch-size", type=int, default=64)
+-    p.add_argument("--layout", choices=["nhwc", "nchw"], default="nhwc")
+-    p.add_argument("--normalize", choices=["none", "imagenet"], default="none")
+-    p.add_argument("--input-size", type=int, nargs=2, metavar=("H", "W"), default=None)
++    p.add_argument("--batch-size", type=int, default=32,
++                   help="Cross-attention 4096x1369 por frame: bajar si la GPU compartida va justa")
++    p.add_argument("--pad-factor", type=float, default=1.2,
++                   help="Relleno a cuadrado como el demo (1.0-1.5). Se omite si el RGB ya es cuadrado")
+     p.add_argument("--depth-axis", type=int, default=2, choices=[0, 1, 2])
+     p.add_argument("--reduce-axis", type=int, default=0, choices=[0, 1, 2])
+     p.add_argument("--allow-missing", action="store_true")
+@@ -145,11 +152,13 @@ def main():
+     os.chdir(args.vhuman_root)  # config y weights son relativos a vhuman3d_deploy
+ 
+     device = "cuda" if torch.cuda.is_available() else "cpu"
++    if device == "cuda":
++        torch.set_float32_matmul_precision("high")  # igual que demo.py
+     print(f"Cargando modelo en {device}...")
+     model = cargar_modelo(args.config, args.weights, device, args.allow_missing)
+ 
+     if args.check:
+-        check(model, args, device, rgb_root)
++        check(model, device, rgb_root, sorted({1.0, args.pad_factor}))
+         return
+ 
+     out_root.mkdir(parents=True, exist_ok=True)
+@@ -159,7 +168,7 @@ def main():
+ 
+     n_ok = n_skip = n_fail = 0
+     for sujeto in sujetos:
+-        for seq in sorted(p for p in sujeto.glob('*/*') if p.is_dir()):
++        for seq in sorted(p for p in sujeto.glob("*/*") if p.is_dir()):
+             rel = seq.relative_to(rgb_root)
+             out_dir = out_root / rel
+             if (out_dir / "features.npy").exists() and not args.overwrite:
+@@ -179,16 +188,15 @@ def main():
+             try:
+                 feats = []
+                 for i in range(0, len(frames), args.batch_size):
+-                    chunk = frames[i:i + args.batch_size]
+                     rgb = []
+-                    for f in chunk:
++                    for f in frames[i:i + args.batch_size]:
+                         img = cv2.imread(str(f))
+                         if img is None:
+                             raise IOError(f"no se pudo leer {f.name}")
+                         rgb.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+-                    vol = volumen_3d(model, preprocesar(rgb, args, device))
++                    vol = volumen_3d(model, preprocesar(rgb, args.pad_factor, device))
+                     feats.append(reducir(vol, args.depth_axis, args.reduce_axis).half().cpu())
+-                feats = torch.cat(feats).numpy()             # [T, 16, 768] float16
++                feats = torch.cat(feats).numpy()                       # [T, 16, 768] float16
+             except Exception as e:  # noqa: BLE001
+                 print(f"  [FAIL] {rel}: {e} -> secuencia descartada")
+                 n_fail += 1
+@@ -197,7 +205,7 @@ def main():
+             out_dir.mkdir(parents=True, exist_ok=True)
+             tmp = out_dir / "features.tmp.npy"
+             np.save(tmp, feats)
+-            tmp.replace(out_dir / "features.npy")           # escritura atómica
++            tmp.replace(out_dir / "features.npy")                     # escritura atómica
+             (out_dir / "frames.txt").write_text("\n".join(f.name for f in frames) + "\n")
+             n_ok += 1
+             print(f"  {rel}: {feats.shape}")
+diff --git a/data/procesar_casiab_yolo.py b/data/procesar_casiab_yolo.py
+index f23505d..d788d56 100644
+--- a/data/procesar_casiab_yolo.py
++++ b/data/procesar_casiab_yolo.py
+@@ -54,6 +54,17 @@ def normalizar_con_padding(img, output_size=OUTPUT_SIZE, interpolation=cv2.INTER
+     return lienzo
+ 
+ 
++def pad_cuadrado(img, pad_factor):
++    """Centra la imagen en un cuadrado negro de pad_factor x lado mayor
++    (réplica de pad_cropped_image() del demo de VHuman3D)."""
++    h, w = img.shape[:2]
++    side = int(max(h, w) * pad_factor)
++    lienzo = np.zeros((side, side) + img.shape[2:], dtype=img.dtype)
++    y_off, x_off = (side - h) // 2, (side - w) // 2
++    lienzo[y_off:y_off + h, x_off:x_off + w] = img
++    return lienzo
++
++
+ def extraer_persona_y_silueta(frame, modelo_yolo):
+     """
+     Detecta la persona principal en el frame y devuelve:
+@@ -128,9 +139,15 @@ def main():
+     parser.add_argument("--rgb-size", type=int, nargs=2, metavar=("H", "W"),
+                         default=list(OUTPUT_SIZE),
+                         help="Tamaño del RGB para el maestro (por defecto igual a la silueta). "
+-                             "Ajustar a la resolución de entrada de VHuman3D.")
++                             "Recomendado para VHuman3D: 256 256 con --rgb-pad-factor 1.2")
++    parser.add_argument("--rgb-pad-factor", type=float, default=0.0,
++                        help="Si > 0, el RGB se rellena a un cuadrado de factor x lado mayor "
++                             "(como el demo de VHuman3D) antes de redimensionar; requiere "
++                             "--rgb-size cuadrado. 0 = comportamiento original.")
+     args = parser.parse_args()
+     rgb_size = tuple(args.rgb_size)
++    if args.rgb_pad_factor > 0 and rgb_size[0] != rgb_size[1]:
++        parser.error("--rgb-pad-factor requiere un --rgb-size cuadrado")
+ 
+     in_root = Path(args.input)
+     out_root = Path(args.output)
+@@ -184,9 +201,13 @@ def main():
+ 
+                     # Normalizar ambos al mismo tamaño
+                     reduce = rgb_crop.shape[0] > rgb_size[0]
+-                    rgb_norm = normalizar_con_padding(
+-                        rgb_crop, rgb_size,
+-                        cv2.INTER_AREA if reduce else cv2.INTER_LINEAR)
++                    interp = cv2.INTER_AREA if reduce else cv2.INTER_LINEAR
++                    if args.rgb_pad_factor > 0:
++                        rgb_sq = pad_cuadrado(rgb_crop, args.rgb_pad_factor)
++                        rgb_norm = cv2.resize(rgb_sq, (rgb_size[1], rgb_size[0]),
++                                              interpolation=interp)
++                    else:
++                        rgb_norm = normalizar_con_padding(rgb_crop, rgb_size, interp)
+                     sil_norm = normalizar_con_padding(sil_crop, OUTPUT_SIZE)
+ 
+                     # Guardar con el mismo nombre base
+-- 
+2.43.0
+
+
+From 5a5f66cadc64111db7d6fbf7db1a2e8ca613f74a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 10:39:17 +0100
+Subject: [PATCH 3/3] =?UTF-8?q?A=C3=B1ade=20evaluaci=C3=B3n=20de=20la=20de?=
+ =?UTF-8?q?stilaci=C3=B3n=20en=20identidades=20no=20vistas=20y=20export=20?=
+ =?UTF-8?q?del=20backbone?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Las métricas del entrenamiento solo cubren TRAIN_SET, por lo que no indican si el
+mapeo silueta -> maestro generaliza a sujetos nuevos.
+
+data/evaluar_destilacion.py recorre un split (TEST_SET por defecto) en una sola
+pasada y en float64, e informa cos_sim, Smooth L1, CKA lineal, cos por franja y el
+baseline del predictor trivial (media por franja), con el porcentaje de margen
+cerrado. El baseline se obtiene sin segunda pasada mediante la identidad
+mean_t cos(t, m_p) = (A_p . m_p) / |m_p|.
+
+Exporta además el backbone sin proj_head en dos convenciones de nombres: la de
+StudentDistill y la de DeepGaitV2 en modo 2d, que envuelve layer0..layer4 en
+SetBlockWrapper y por tanto necesita el prefijo forward_block.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WK6ob9J25CSVfCkuYYaVq8
+---
+ README.md                   |  13 ++
+ data/evaluar_destilacion.py | 270 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 283 insertions(+)
+ create mode 100644 data/evaluar_destilacion.py
+
+diff --git a/README.md b/README.md
+index 4ec5bff..36a39b4 100644
+--- a/README.md
++++ b/README.md
+@@ -13,6 +13,7 @@ Feature distillation VHuman3D (RGB, congelado) → DeepGaitV2-2D (siluetas 64×4
+ | 5. Estadísticas | `data/calcular_stats_maestro.py` | `teacher_stats.npz` (solo TRAIN_SET) |
+ | 6. Instalación en OpenGait | `scripts/install_into_opengait.sh` | enlaces en `opengait/modeling/{models,losses}` |
+ | 7. Entrenamiento | `scripts/train_distill.py` | `OpenGait/output/CASIA-B/StudentDistill/...` |
++| 8. Evaluación + export | `data/evaluar_destilacion.py --checkpoint ... --export backbone_fase1` | `cos_sim`/CKA en TEST_SET, `backbone_fase1_{student,deepgaitv2}.pt` |
+ 
+ ```bash
+ bash scripts/install_into_opengait.sh
+@@ -22,6 +23,18 @@ python -m torch.distributed.run --nproc_per_node=1 scripts/train_distill.py \
+ 
+ Prueba rápida con 5 sujetos: `dataset_partition: <repo>/configs/CASIA-B-debug5.json`.
+ 
++## Cómo leer las métricas
++
++`cos_sim` no se interpreta contra 0 sino contra el **baseline por franja**: la HPP da al
++estudiante la identidad de la franja gratis, así que predecir la media de cada franja ya
++alcanza ~0.41 en CASIA-B sin haber aprendido nada. `evaluar_destilacion.py` reporta ese
++baseline sobre el propio split y el porcentaje de margen cerrado, que es la cifra
++comparable entre corridas. `valid_ratio` debe ser 1.0: por debajo hay secuencias sin
++maestro o con longitud distinta a las siluetas.
++
++Las cifras del entrenamiento son sobre `TRAIN_SET` y no dicen si el mapeo generaliza a
++identidades nuevas; para eso está el paso 8 sobre `TEST_SET`.
++
+ ## Diseño
+ 
+ - `StudentDistill` sobrescribe `get_loader` e `inputs_pretreament`: no hay monkeypatching ni
+diff --git a/data/evaluar_destilacion.py b/data/evaluar_destilacion.py
+new file mode 100644
+index 0000000..76beca7
+--- /dev/null
++++ b/data/evaluar_destilacion.py
+@@ -0,0 +1,270 @@
++#!/usr/bin/env python3
++"""
++Evalúa la destilación sobre identidades no vistas y exporta el backbone sin proj_head.
++
++El entrenamiento solo informa cos_sim sobre TRAIN_SET, lo que no dice si el mapeo
++silueta -> maestro generaliza a sujetos nuevos. Este script recorre el split indicado
++(TEST_SET por defecto) y reporta:
++
++    cos_sim        similitud coseno media estudiante/maestro, por token [frame, franja]
++    loss_l1        Smooth L1 medio (misma beta que la pérdida de entrenamiento)
++    baseline       cos_sim de un predictor trivial = media por franja del propio split
++    gap cerrado    (cos_sim - baseline) / (1 - baseline): cuánto aporta el estudiante
++    CKA lineal     similitud de estructura entre ambos espacios de features
++    cos por franja las 16 franjas por separado (detecta franjas que no se aprenden)
++
++Todas las cifras se calculan en una sola pasada y en float64.
++
++Uso:
++    python data/evaluar_destilacion.py \
++        --checkpoint ~/OpenGait/output/CASIA-B/StudentDistill/StudentDistill_Phase1/checkpoints/StudentDistill_Phase1-10000.pt \
++        --cfg configs/student_distill_casiab.yaml \
++        --opengait-root ~/OpenGait \
++        --export backbone_fase1
++"""
++import argparse
++import json
++import pickle
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++import yaml
++
++
++# --------------------------------------------------------------------------- #
++#  Modelo
++# --------------------------------------------------------------------------- #
++def construir_modelo(model_cfg, opengait_root, device):
++    """Instancia StudentDistill sin pasar por BaseModel.__init__ (que exige DDP/CUDA)."""
++    og = Path(opengait_root).expanduser().resolve() / "opengait"
++    if not og.is_dir():
++        sys.exit(f"No existe {og}: revisa --opengait-root")
++    sys.path.insert(0, str(og))
++    import torch.nn as nn
++    from modeling.models.student_distill import StudentDistill
++
++    net = StudentDistill.__new__(StudentDistill)
++    nn.Module.__init__(net)
++    net.build_network(model_cfg)
++    return net.to(device).eval()
++
++
++def cargar_pesos(net, checkpoint, device):
++    ck = torch.load(checkpoint, map_location=device, weights_only=False)
++    sd = ck.get('model', ck)
++    sd = {k[7:] if k.startswith('module.') else k: v for k, v in sd.items()}
++    res = net.load_state_dict(sd, strict=False)
++    if res.missing_keys:
++        sys.exit(f"Faltan {len(res.missing_keys)} pesos en el checkpoint, p.ej. {res.missing_keys[:5]}")
++    if res.unexpected_keys:
++        print(f"[warn] {len(res.unexpected_keys)} claves sobrantes ignoradas: {res.unexpected_keys[:5]}")
++    print(f"[ckpt] iteración {ck.get('iteration', '?')} | {checkpoint}")
++    return ck.get('iteration', 0)
++
++
++def exportar(net, destino, class_num):
++    """Guarda el backbone sin proj_head, en las dos convenciones de nombres útiles."""
++    sd = {k: v for k, v in net.state_dict().items() if not k.startswith('proj_head.')}
++    destino = Path(destino)
++
++    p1 = destino.with_name(destino.name + "_student.pt")
++    torch.save({'model': sd, 'iteration': 0}, p1)
++
++    # DeepGaitV2 envuelve layer0..layer4 en SetBlockWrapper -> prefijo 'forward_block.'
++    remap = {}
++    for k, v in sd.items():
++        if k.split('.')[0] in ('layer0', 'layer1', 'layer2', 'layer3', 'layer4'):
++            head, rest = k.split('.', 1)
++            remap[f"{head}.forward_block.{rest}"] = v
++        else:
++            remap[k] = v
++    p2 = destino.with_name(destino.name + "_deepgaitv2.pt")
++    torch.save({'model': remap, 'iteration': 0}, p2)
++
++    print(f"[export] {p1}  (StudentDistill / fase 2 con recognition_losses)")
++    print(f"[export] {p2}  (DeepGaitV2 mode 2d, class_num={class_num})")
++
++
++# --------------------------------------------------------------------------- #
++#  Acumuladores
++# --------------------------------------------------------------------------- #
++class Acumulador:
++    """Métricas por token en una pasada. Todo en float64.
++
++    El baseline por franja se obtiene sin segunda pasada: si m_p es la media de los
++    tokens del maestro en la franja p y A_p la media de esos tokens normalizados,
++        mean_t cos(t, m_p) = (A_p . m_p) / |m_p|
++    """
++
++    def __init__(self, dim, parts, device):
++        z = lambda *s: torch.zeros(*s, dtype=torch.float64, device=device)
++        self.dim, self.parts = dim, parts
++        self.cos_sum, self.l1_sum, self.n = 0.0, 0.0, 0
++        self.cos_part, self.n_part = z(parts), z(parts)
++        self.t_sum, self.t_unit = z(parts, dim), z(parts, dim)
++        self.XtX, self.YtY, self.YtX = z(dim, dim), z(dim, dim), z(dim, dim)
++        self.sx, self.sy = z(dim), z(dim)
++
++    def add(self, s, t):
++        """s, t: [n, parts, dim] (estudiante, maestro ya estandarizado)."""
++        s, t = s.double(), t.double()
++        cos = F.cosine_similarity(s, t, dim=-1, eps=1e-8)          # [n, parts]
++        self.cos_sum += float(cos.sum())
++        self.l1_sum += float(F.smooth_l1_loss(s, t, beta=1.0, reduction='sum')) / self.dim
++        self.n += cos.numel()
++        self.cos_part += cos.sum(0)
++        self.n_part += cos.shape[0]
++
++        self.t_sum += t.sum(0)
++        self.t_unit += (t / t.norm(dim=-1, keepdim=True).clamp_min(1e-12)).sum(0)
++
++        X = s.reshape(-1, self.dim)
++        Y = t.reshape(-1, self.dim)
++        self.XtX += X.T @ X
++        self.YtY += Y.T @ Y
++        self.YtX += Y.T @ X
++        self.sx += X.sum(0)
++        self.sy += Y.sum(0)
++
++    def cka(self):
++        n = float(self.n)
++        mx, my = self.sx / n, self.sy / n
++        Xc = self.XtX - n * torch.outer(mx, mx)
++        Yc = self.YtY - n * torch.outer(my, my)
++        C = self.YtX - n * torch.outer(my, mx)
++        den = Xc.norm() * Yc.norm()
++        return float(C.norm() ** 2 / den) if den > 0 else float('nan')
++
++    def baseline(self):
++        m = self.t_sum / self.n_part[:, None]                       # [parts, dim]
++        a = self.t_unit / self.n_part[:, None]
++        per_part = (a * m).sum(-1) / m.norm(dim=-1).clamp_min(1e-12)
++        return float(per_part.mean())
++
++    def resumen(self):
++        cos = self.cos_sum / self.n
++        base = self.baseline()
++        return {
++            'cos_sim': cos,
++            'loss_l1': self.l1_sum / self.n,
++            'baseline': base,
++            'gap': (cos - base) / (1.0 - base) if base < 1.0 else float('nan'),
++            'cka': self.cka(),
++            'cos_part': (self.cos_part / self.n_part).cpu().numpy(),
++            'tokens': self.n,
++        }
++
++
++# --------------------------------------------------------------------------- #
++#  Recorrido del split
++# --------------------------------------------------------------------------- #
++def secuencias(sil_root, teacher_root, pids):
++    for pid in pids:
++        for d in sorted(p for p in (teacher_root / pid).glob("*/*") if (p / "features.npy").exists()):
++            rel = d.relative_to(teacher_root)
++            sil_dir = sil_root / rel
++            pkls = sorted(sil_dir.glob("*.pkl"))
++            if pkls:
++                yield rel, pkls[0], d / "features.npy"
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--checkpoint", required=True)
++    p.add_argument("--cfg", default="configs/student_distill_casiab.yaml")
++    p.add_argument("--opengait-root", default="~/OpenGait")
++    p.add_argument("--partition", default="", help="Por defecto, el del yaml resuelto contra --opengait-root")
++    p.add_argument("--split", default="TEST_SET", choices=["TEST_SET", "TRAIN_SET"])
++    p.add_argument("--max-frames-seq", type=int, default=20,
++                   help="Frames equiespaciados por secuencia (0 = todos)")
++    p.add_argument("--max-seqs", type=int, default=0, help="Limitar nº de secuencias (0 = todas)")
++    p.add_argument("--batch-frames", type=int, default=256)
++    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    p.add_argument("--export", default="", help="Prefijo de salida del backbone sin proj_head")
++    args = p.parse_args()
++
++    cfg = yaml.safe_load(Path(args.cfg).read_text())
++    data_cfg, model_cfg = cfg['data_cfg'], cfg['model_cfg']
++    og_root = Path(args.opengait_root).expanduser().resolve()
++
++    net = construir_modelo(model_cfg, og_root, args.device)
++    it = cargar_pesos(net, Path(args.checkpoint).expanduser(), args.device)
++
++    from data.transform import get_transform
++    trf = get_transform(cfg['evaluator_cfg']['transform'])[0]
++
++    part_path = Path(args.partition).expanduser() if args.partition else \
++        (og_root / data_cfg['dataset_partition']).resolve()
++    pids = json.loads(part_path.read_text())[args.split]
++    print(f"[split] {args.split}: {len(pids)} sujetos | partición {part_path}")
++
++    sil_root = Path(data_cfg['dataset_root'])
++    teacher_root = Path(data_cfg['teacher_root'])
++    stats = data_cfg.get('teacher_stats')
++    if stats:
++        st = np.load(stats)
++        t_mean = torch.as_tensor(st['mean'], dtype=torch.float32, device=args.device)
++        t_std = torch.as_tensor(np.maximum(st['std'], 1e-6), dtype=torch.float32, device=args.device)
++    else:
++        t_mean = t_std = None
++
++    acc = Acumulador(model_cfg.get('teacher_dim', 768), 16, args.device)
++    n_ok = n_skip = 0
++
++    with torch.no_grad():
++        for rel, pkl, feat_path in secuencias(sil_root, teacher_root, pids):
++            if args.max_seqs and n_ok >= args.max_seqs:
++                break
++            sils = np.asarray(pickle.load(open(pkl, 'rb')))
++            teacher = np.load(feat_path, mmap_mode='r')
++            if teacher.ndim != 3 or teacher.shape[0] != len(sils):
++                print(f"  [SKIP] {rel}: T maestro={teacher.shape[0]} vs siluetas={len(sils)}")
++                n_skip += 1
++                continue
++
++            T = len(sils)
++            idx = np.arange(T) if not args.max_frames_seq or T <= args.max_frames_seq else \
++                np.unique(np.linspace(0, T - 1, args.max_frames_seq).astype(int))
++
++            for i in range(0, len(idx), args.batch_frames):
++                sub = idx[i:i + args.batch_frames]
++                x = np.stack([trf(sils[j]) for j in sub]).astype(np.float32)
++                x = torch.from_numpy(x).to(args.device)[:, None]              # [n, 1, H, W]
++                out = net.layer4(net.layer3(net.layer2(net.layer1(net.layer0(x)))))
++                s = net.proj_head(net.HPP(out).permute(0, 2, 1))              # [n, 16, 768]
++
++                t = torch.from_numpy(np.asarray(teacher[sub], dtype=np.float32)).to(args.device)
++                if t_mean is not None:
++                    t = (t - t_mean) / t_std
++                acc.add(s, t)
++
++            n_ok += 1
++            if n_ok % 200 == 0:
++                print(f"  {n_ok} secuencias | cos_sim parcial = {acc.cos_sum / acc.n:.4f}")
++
++    if acc.n == 0:
++        sys.exit("No se evaluó ningún token: revisa dataset_root/teacher_root y el split")
++
++    r = acc.resumen()
++    print(f"\n=== Destilación en {args.split} (iteración {it}) ===")
++    print(f"secuencias     : {n_ok} evaluadas, {n_skip} descartadas")
++    print(f"tokens         : {r['tokens']}")
++    print(f"cos_sim        : {r['cos_sim']:.4f}")
++    print(f"baseline franja: {r['baseline']:.4f}")
++    print(f"gap cerrado    : {100 * r['gap']:.1f} %")
++    print(f"loss_l1        : {r['loss_l1']:.4f}")
++    print(f"CKA lineal     : {r['cka']:.4f}")
++    cp = r['cos_part']
++    print("cos por franja (0 = arriba):")
++    print("  " + "  ".join(f"{v:.3f}" for v in cp))
++    print(f"  min {cp.min():.3f} (franja {int(cp.argmin())}) | max {cp.max():.3f} (franja {int(cp.argmax())})")
++
++    if args.export:
++        exportar(net, args.export, model_cfg['SeparateBNNecks']['class_num'])
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
