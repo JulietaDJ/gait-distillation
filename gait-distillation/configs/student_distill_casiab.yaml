@@ -1,0 +1,102 @@
+# ==========================================
+# Fase 1: Feature Distillation (VHuman3D -> DeepGaitV2-2D)
+# ==========================================
+# Para pruebas con 5 sujetos: dataset_partition: <repo>/configs/CASIA-B-debug5.json
+
+data_cfg:
+  dataset_name: CASIA-B
+  dataset_root: /opt3/data/julieta/CASIA-B-yolo-pkl
+  dataset_partition: ./datasets/CASIA-B/CASIA-B.json
+  # Formato compacto [T,16,768] fp16 generado por data/extraer_features_vhuman.py.
+  # El formato antiguo [T,16,16,768] también se acepta (más lento, solo para pruebas).
+  teacher_root: /opt3/data/julieta/vhuman_features_v2
+  # Estandarización por canal (data/calcular_stats_maestro.py). Comentar si no existe aún
+  # y usar en su lugar teacher_norm: layernorm en la pérdida.
+  teacher_stats: /opt3/data/julieta/vhuman_features_v2/teacher_stats.npz
+  # Solo para el formato antiguo: eje de la rejilla [16,16] a promediar (0 = comportamiento original).
+  legacy_reduce_axis: 0
+  num_workers: 4            # servidor compartido: subir solo si la GPU espera al DataLoader
+  cache: false
+  remove_no_gallery: false
+  test_dataset_name: CASIA-B
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_name: StudentDistill_Phase1
+  eval_func: evaluate_indoor_dataset
+  sampler:
+    batch_size: 4
+    sample_type: all_ordered
+    type: InferenceSampler
+  transform:
+    - type: BaseSilCuttingTransform   # /255; con ancho 44 no recorta
+  metric: euc
+
+loss_cfg:
+  - type: DistillationLoss
+    log_prefix: distill
+    loss_term_weight: 1.0
+    w_l1: 1.0
+    w_cos: 1.0
+    beta: 1.0
+    teacher_norm: none        # 'layernorm' si no se usa teacher_stats
+  # Regularizador de reconocimiento (fase 2 / opcional). Requiere model_cfg.recognition_losses: true
+  # - type: TripletLoss
+  #   log_prefix: triplet
+  #   loss_term_weight: 0.1
+  #   margin: 0.2
+  # - type: CrossEntropyLoss
+  #   log_prefix: softmax
+  #   loss_term_weight: 0.1
+  #   scale: 16
+  #   log_accuracy: true
+
+model_cfg:
+  model: StudentDistill
+  Backbone:
+    in_channels: 1
+    layers: [1, 1, 1, 1]
+    channels: [64, 128, 256, 512]
+  SeparateBNNecks:
+    class_num: 74
+  teacher_dim: 768
+  proj_hidden: 1024
+  recognition_losses: false
+  use_emb2: true              # FCs/BNNecks no se entrenan en fase 1: la inferencia de reconocimiento no es significativa
+
+# Regresión de features: AdamW suele ser más estable que SGD lr=0.1 (heredado de reconocimiento).
+optimizer_cfg:
+  solver: AdamW
+  lr: 0.001
+  weight_decay: 0.01
+
+scheduler_cfg:
+  scheduler: MultiStepLR
+  milestones: [30000, 50000]
+  gamma: 0.1
+
+trainer_cfg:
+  find_unused_parameters: true   # FCs/BNNecks no participan si recognition_losses = false
+  enable_float16: true
+  with_test: false
+  log_iter: 100
+  fix_BN: false
+  optimizer_reset: false
+  scheduler_reset: false
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_iter: 10000
+  save_name: StudentDistill_Phase1
+  sync_BN: true
+  total_iter: 60000
+  sampler:
+    type: TripletSampler
+    batch_shuffle: false
+    batch_size: [8, 16]
+    sample_type: fixed_unordered
+    frames_num_fixed: 30
+  # Sin flip/rotación: el maestro está precalculado y no recibe la misma augmentación.
+  transform:
+    - type: BaseSilCuttingTransform

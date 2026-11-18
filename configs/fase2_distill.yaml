@@ -1,0 +1,100 @@
+# ==========================================
+# Fase 2: Reconocimiento con DeepGaitV2-2D   [DeepGaitV2_distill]
+# ==========================================
+# Arm B (destilado) del A/B. Las dos configuraciones son idénticas salvo
+# trainer_cfg.restore_hint y save_name. Cualquier otro cambio invalida la
+# comparación: si tocas una, toca la otra igual.
+#
+# mode: 2d (no p3d, que es la receta publicada de OpenGait para CASIA-B).
+# El estudiante de la fase 1 es 2D, así que la transferencia solo tiene
+# sentido con 2d. Los rank-1 absolutos quedarán por debajo de los del paper.
+
+data_cfg:
+  dataset_name: CASIA-B
+  dataset_root: /opt3/data/julieta/CASIA-B-yolo-pkl
+  dataset_partition: ./datasets/CASIA-B/CASIA-B.json
+  num_workers: 4
+  remove_no_gallery: false
+  test_dataset_name: CASIA-B
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: true
+  restore_hint: 60000
+  save_name: DeepGaitV2_distill
+  eval_func: evaluate_indoor_dataset
+  sampler:
+    batch_shuffle: false
+    batch_size: 1           # OpenGait exige == nº de GPUs en --phase test; run_fase2 evalúa
+                            # con data/evaluar_reconocimiento.py y no depende de esto
+    sample_type: all_ordered
+    frames_all_limit: 720
+  metric: euc
+  transform:
+    - type: BaseSilCuttingTransform
+
+loss_cfg:
+  - type: TripletLoss
+    loss_term_weight: 1.0
+    margin: 0.2
+    log_prefix: triplet
+  - type: CrossEntropyLoss
+    loss_term_weight: 1.0
+    scale: 16
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  model: DeepGaitV2
+  Backbone:
+    mode: 2d
+    in_channels: 1
+    layers: [1, 1, 1, 1]
+    channels: [64, 128, 256, 512]
+  SeparateBNNecks:
+    class_num: 74
+
+optimizer_cfg:
+  solver: SGD
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  scheduler: MultiStepLR
+  gamma: 0.1
+  milestones: [20000, 40000, 50000]
+
+trainer_cfg:
+  enable_float16: true
+  fix_BN: false
+  log_iter: 100
+  with_test: false
+  save_iter: 10000
+  save_name: DeepGaitV2_distill
+  sync_BN: true
+  total_iter: 60000
+  optimizer_reset: true     # el checkpoint de la fase 1 no trae optimizador
+  scheduler_reset: true
+  restore_ckpt_strict: true
+  restore_hint: /opt3/data/julieta/gait-distillation/backbone_fase1_deepgaitv2.pt
+  # restore_hint como ruta -> carga el backbone y arranca en iteración 0.
+  # restore_ckpt_strict: true es deliberado: si los nombres de capa no
+  # cuadran, falla en voz alta en lugar de entrenar desde cero en silencio.
+  sampler:
+    batch_shuffle: true
+    batch_size: [8, 16]
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    sample_type: fixed_ordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomPerspective
+          prob: 0.2
+        - type: BaseSilCuttingTransform
+        - type: RandomHorizontalFlip
+          prob: 0.2
+        - type: RandomRotate
+          prob: 0.2
